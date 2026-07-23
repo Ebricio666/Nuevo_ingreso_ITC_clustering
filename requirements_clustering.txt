@@ -5,3 +5,6 @@ openpyxl>=3.1
 plotly>=5.0
 scikit-learn>=1.4
 requests>=2.31
+plotly==5.xx
+scikit-learn==1.xx
+openpyxl
