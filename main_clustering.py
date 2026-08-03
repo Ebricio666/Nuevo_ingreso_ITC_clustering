@@ -577,6 +577,79 @@ def hist_obtener_nombre_carrera(nombre_hoja, df_crudo):
     return str(nombre_hoja).strip()
 
 
+def hist_convertir_calificacion_propedeutico(valor):
+    """
+    Convierte calificaciones del curso propedéutico a escala 0-100.
+
+    Reglas:
+    - vacío, guiones, puntos o frases como "no presentó" -> 0;
+    - números y textos numéricos entre 0 y 100 -> valor numérico;
+    - fechas accidentales de Excel (p. ej. 27.12 interpretado como 27-dic) -> 27.12;
+    - valores fuera de rango -> NaN para evitar incorporarlos al clustering.
+    """
+    if pd.isna(valor):
+        return 0.0, "Sin calificación: asignado 0"
+
+    if isinstance(valor, (datetime, date, pd.Timestamp)):
+        numero = float(valor.day) + float(valor.month) / 100
+        return round(numero, 2), "Recuperado de formato fecha"
+
+    texto = str(valor).strip().lower()
+    texto = texto.replace("\xa0", " ")
+
+    if texto == "" or re.fullmatch(r"[\-–—_.\s]+", texto):
+        return 0.0, "Sin calificación: asignado 0"
+
+    expresiones_cero = [
+        "no present", "no se present", "no asist", "sin calificacion",
+        "sin calificación", "n/a", "np"
+    ]
+    if any(expresion in texto for expresion in expresiones_cero):
+        return 0.0, "No presentó: asignado 0"
+
+    texto = texto.replace("%", "").replace(" ", "")
+    if "," in texto and "." not in texto:
+        texto = texto.replace(",", ".")
+    elif "," in texto and "." in texto:
+        texto = texto.replace(",", "")
+
+    try:
+        numero = float(texto)
+    except (TypeError, ValueError):
+        return 0.0, "Texto no numérico: asignado 0"
+
+    # Números seriales de fecha de Excel.
+    if 30000 <= numero <= 60000:
+        fecha = datetime(1899, 12, 30) + pd.to_timedelta(numero, unit="D")
+        recuperado = float(fecha.day) + float(fecha.month) / 100
+        return round(recuperado, 2), "Recuperado de serial de fecha"
+
+    if 0 <= numero <= 100:
+        return round(numero, 2), "Válido"
+
+    return np.nan, "Dato dudoso: fuera de rango"
+
+
+def hist_detectar_columnas_propedeutico(df):
+    """Detecta las columnas de Ciencias Básicas y del departamento académico."""
+    columnas_calificacion = [
+        columna for columna in df.columns
+        if "cal final" in util_limpiar_texto(columna)
+    ]
+
+    columna_basicas = None
+    columna_departamento = None
+
+    for columna in columnas_calificacion:
+        texto = util_limpiar_texto(columna)
+        if "basica" in texto or "basicas" in texto:
+            columna_basicas = columna
+        elif columna_departamento is None:
+            columna_departamento = columna
+
+    return columna_basicas, columna_departamento
+
+
 def hist_convertir_promedio(valor):
     """
     Convierte promedio de bachillerato a escala 0-100.
@@ -902,19 +975,13 @@ def hist_normalizar_escuela_procedencia(valor):
 
 def hist_encontrar_nombre_historial(df):
     """
-    Detecta las columnas de nombre del Historial.
-
-    Devuelve apellido paterno, apellido materno y nombre cuando vienen
-    separados. Si el archivo usa una sola columna de nombre completo,
-    la devuelve como ``col_nombre`` y deja ambos apellidos en ``None``.
+    Detecta apellido paterno, apellido materno y nombre.
     """
 
     col_apellido_paterno = util_encontrar_columna(
         df,
         [
             "Apellido paterno",
-            "Apellido(s)",
-            "Apellidos",
             "Primer apellido",
             "Paterno"
         ]
@@ -938,24 +1005,6 @@ def hist_encontrar_nombre_historial(df):
             "Nombre"
         ]
     )
-
-    # Algunos archivos actualizados concentran apellidos y nombres en una
-    # sola columna. Se reconoce antes de declarar que faltan encabezados.
-    col_nombre_completo = util_encontrar_columna(
-        df,
-        [
-            "Nombre completo",
-            "Nombre del aspirante",
-            "Nombre de aspirante",
-            "Aspirante",
-            "Nombre visible",
-            "Nombre completo historial",
-            "Nombre completo Historial"
-        ]
-    )
-
-    if col_apellido_paterno is None and col_nombre_completo is not None:
-        return None, None, col_nombre_completo
 
     return col_apellido_paterno, col_apellido_materno, col_nombre
 
@@ -1041,27 +1090,61 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
         df["Promedio bachillerato 100"] = np.nan
         df["Estatus promedio bachillerato"] = "No se encontró columna de promedio"
 
+    # --------------------------------------------------------
+    # Calificaciones del curso propedéutico
+    # --------------------------------------------------------
+    columna_basicas, columna_departamento = hist_detectar_columnas_propedeutico(df)
+
+    if columna_basicas is not None:
+        resultado_basicas = df[columna_basicas].apply(
+            hist_convertir_calificacion_propedeutico
+        )
+        df["Propedéutico Ciencias Básicas"] = resultado_basicas.apply(lambda x: x[0])
+        df["Estatus Propedéutico Ciencias Básicas"] = resultado_basicas.apply(lambda x: x[1])
+    else:
+        df["Propedéutico Ciencias Básicas"] = np.nan
+        df["Estatus Propedéutico Ciencias Básicas"] = "No se encontró columna"
+
+    if columna_departamento is not None:
+        resultado_departamento = df[columna_departamento].apply(
+            hist_convertir_calificacion_propedeutico
+        )
+        df["Propedéutico Departamento"] = resultado_departamento.apply(lambda x: x[0])
+        df["Estatus Propedéutico Departamento"] = resultado_departamento.apply(lambda x: x[1])
+        df["Nombre evaluación departamental"] = str(columna_departamento)
+    else:
+        # Si toda la carrera carece de columna departamental, se usa Ciencias Básicas.
+        df["Propedéutico Departamento"] = df["Propedéutico Ciencias Básicas"]
+        df["Estatus Propedéutico Departamento"] = "Copiado de Ciencias Básicas"
+        df["Nombre evaluación departamental"] = "Sin columna propia; se usó Ciencias Básicas"
+
+    # Si la columna existe pero está completamente vacía en la hoja/grupo,
+    # también se toma Ciencias Básicas para conservar la regla acordada.
+    if df["Propedéutico Departamento"].notna().sum() == 0:
+        df["Propedéutico Departamento"] = df["Propedéutico Ciencias Básicas"]
+        df["Estatus Propedéutico Departamento"] = "Copiado de Ciencias Básicas"
+
+    df["Promedio Propedéutico"] = df[
+        ["Propedéutico Ciencias Básicas", "Propedéutico Departamento"]
+    ].mean(axis=1)
+
     col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(df)
 
-    if col_apellido_paterno is not None and col_nombre is not None:
-
+    if col_apellido_paterno is None and col_nombre is not None:
+        df["Nombre completo historial"] = df[col_nombre].fillna("").astype(str)
+    elif col_apellido_paterno is not None and col_nombre is not None:
         if col_apellido_materno is None:
             df["Nombre completo historial"] = (
-                df[col_apellido_paterno].fillna("").astype(str)
-                + " "
-                + df[col_nombre].fillna("").astype(str)
+                df[col_apellido_paterno].fillna("").astype(str) + " " + df[col_nombre].fillna("").astype(str)
             )
         else:
             df["Nombre completo historial"] = (
-                df[col_apellido_paterno].fillna("").astype(str)
-                + " "
-                + df[col_apellido_materno].fillna("").astype(str)
-                + " "
+                df[col_apellido_paterno].fillna("").astype(str) + " "
+                + df[col_apellido_materno].fillna("").astype(str) + " "
                 + df[col_nombre].fillna("").astype(str)
             )
-
     else:
-        df["Nombre completo historial"] = "Sin nombre"
+        df["Nombre completo historial"] = ""
 
     df["Nombre visible"] = df["Nombre completo historial"].apply(nombre_visible)
     df["Nombre match"] = df["Nombre completo historial"].apply(normalizar_nombre)
@@ -1940,6 +2023,34 @@ def chaside_procesar_respuestas(
         axis=1
     )
 
+    perfiles_simplificados = {
+        simplificar_carrera(carrera): set(areas)
+        for carrera, areas in CHASIDE_PERFILES_CARRERA.items()
+    }
+
+    def calcular_coincidencia_perfil(fila):
+        """
+        1 si alguna de las dos áreas CHASIDE más fuertes pertenece al perfil
+        vocacional esperado de la carrera elegida; 0 si no coincide.
+        """
+        if fila["Respuesta plana CHASIDE"]:
+            return np.nan
+
+        carrera = simplificar_carrera(fila["Carrera elegida CHASIDE"])
+        areas_esperadas = perfiles_simplificados.get(carrera)
+        if not areas_esperadas:
+            return np.nan
+
+        areas_fuertes = {
+            str(fila["Área fuerte CHASIDE 1"]).split("·")[0].strip(),
+            str(fila["Área fuerte CHASIDE 2"]).split("·")[0].strip()
+        }
+        return float(len(areas_fuertes.intersection(areas_esperadas)) > 0)
+
+    nuevas_columnas["Coincidencia perfil vocacional CHASIDE"] = (
+        nuevas_columnas.apply(calcular_coincidencia_perfil, axis=1)
+    )
+
     return nuevas_columnas.copy()
 
 # ============================================================
@@ -1999,184 +2110,130 @@ def preparar_evaluatec_desde_bloques(datos_eval_global):
     return df_evaluatec
     
 def preparar_historial_para_cruce(df_historial):
-    """
-    Prepara historial para cruce maestro.
-
-    Tolera archivos con nombres en columnas separadas, una sola columna de
-    nombre completo o la columna normalizada creada previamente por
-    ``hist_procesar_hoja``.
-    """
-
+    """Prepara el Historial sin depender del formato exacto de encabezados."""
     df = df_historial.copy()
 
-    # El procesamiento previo ya suele crear esta columna. Se reutiliza para
-    # no depender nuevamente del formato exacto de los encabezados originales.
     columna_nombre_preparada = util_encontrar_columna(
         df,
         [
-            "Nombre completo Historial",
-            "Nombre completo historial",
-            "Nombre visible",
-            "Nombre completo",
-            "Nombre del aspirante",
-            "Aspirante"
+            "Nombre completo historial", "Nombre completo Historial",
+            "Nombre visible", "Nombre completo", "Nombre del aspirante",
+            "Nombre de aspirante", "Aspirante"
         ]
     )
-
     if columna_nombre_preparada is not None:
-        df["Nombre completo Historial"] = df[
-            columna_nombre_preparada
-        ].fillna("").astype(str)
+        df["Nombre completo Historial"] = df[columna_nombre_preparada].fillna("").astype(str)
     else:
-        col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(
-            df
-        )
-
-        # Formato con una sola columna de nombre completo.
+        col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(df)
         if col_apellido_paterno is None and col_nombre is not None:
-            df["Nombre completo Historial"] = df[
-                col_nombre
-            ].fillna("").astype(str)
-
-        # Formato tradicional con apellido paterno + nombre.
+            df["Nombre completo Historial"] = df[col_nombre].fillna("").astype(str)
         elif col_apellido_paterno is not None and col_nombre is not None:
-            if col_apellido_materno is None:
-                df["Nombre completo Historial"] = (
-                    df[col_apellido_paterno].fillna("").astype(str)
-                    + " "
-                    + df[col_nombre].fillna("").astype(str)
-                )
-            else:
-                df["Nombre completo Historial"] = (
-                    df[col_apellido_paterno].fillna("").astype(str)
-                    + " "
-                    + df[col_apellido_materno].fillna("").astype(str)
-                    + " "
-                    + df[col_nombre].fillna("").astype(str)
-                )
+            nombre = df[col_apellido_paterno].fillna("").astype(str)
+            if col_apellido_materno is not None:
+                nombre = nombre + " " + df[col_apellido_materno].fillna("").astype(str)
+            df["Nombre completo Historial"] = nombre + " " + df[col_nombre].fillna("").astype(str)
         else:
-            columnas_disponibles = ", ".join(map(str, df.columns[:25]))
             raise ValueError(
                 "No se identificó una columna utilizable de nombre en Historial. "
-                "Encabezados detectados: " + columnas_disponibles
+                "Encabezados detectados: " + ", ".join(map(str, df.columns[:35]))
             )
 
-    df["Nombre completo Historial"] = df[
-        "Nombre completo Historial"
-    ].apply(nombre_visible)
-
-    df["Nombre match"] = df[
-        "Nombre completo Historial"
-    ].apply(normalizar_nombre)
-
+    df["Nombre completo Historial"] = df["Nombre completo Historial"].apply(nombre_visible)
+    df["Nombre match"] = df["Nombre completo Historial"].apply(normalizar_nombre)
     df = df[
         df["Nombre match"].notna()
-        &
-        (df["Nombre match"].astype(str).str.strip() != "")
-        &
-        (~df["Nombre match"].astype(str).str.contains("AULA", na=False))
+        & (df["Nombre match"].astype(str).str.strip() != "")
+        & (~df["Nombre match"].astype(str).str.contains("AULA", na=False))
+        & (~df["Nombre match"].astype(str).str.contains("SIN NOMBRE", na=False))
     ].copy()
 
-    df["Carrera match Historial"] = df[
-        "Carrera historial"
-    ].apply(simplificar_carrera)
+    if "Carrera historial" not in df.columns:
+        col_carrera = util_encontrar_columna(df, ["Carrera", "Programa", "Especialidad"])
+        df["Carrera historial"] = df[col_carrera] if col_carrera is not None else "Sin dato"
+    df["Carrera match Historial"] = df["Carrera historial"].apply(simplificar_carrera)
 
-    if "Matrícula/ID" not in df.columns:
-        df["Matrícula/ID"] = "Sin dato"
+    defaults = {
+        "Matrícula/ID": "Sin dato", "Sexo": "Sin especificar",
+        "Escuela de procedencia original": "Sin dato",
+        "Escuela de procedencia normalizada": "Sin dato",
+        "Estado de procedencia": "Sin dato",
+        "Promedio bachillerato 100": np.nan,
+        "Estatus promedio bachillerato": "Sin dato",
+        "Propedéutico Ciencias Básicas": np.nan,
+        "Estatus Propedéutico Ciencias Básicas": "Sin dato",
+        "Propedéutico Departamento": np.nan,
+        "Estatus Propedéutico Departamento": "Sin dato",
+        "Promedio Propedéutico": np.nan,
+        "Nombre evaluación departamental": "Sin dato"
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
 
-    if "Sexo" not in df.columns:
-        df["Sexo"] = "Sin especificar"
-
-    if "Escuela de procedencia original" not in df.columns:
-        df["Escuela de procedencia original"] = "Sin dato"
-
-    if "Escuela de procedencia normalizada" not in df.columns:
-        df["Escuela de procedencia normalizada"] = "Sin dato"
-
-    if "Estado de procedencia" not in df.columns:
-        df["Estado de procedencia"] = "Sin dato"
-
+    def normalizar_id(x):
+        if pd.isna(x):
+            return "Sin dato"
+        if isinstance(x, (int, float, np.integer, np.floating)) and float(x).is_integer():
+            return str(int(x))
+        return str(x).strip()
+    df["Matrícula/ID"] = df["Matrícula/ID"].apply(normalizar_id)
+    df = df.drop_duplicates(
+        subset=["Matrícula/ID", "Nombre match", "Carrera match Historial"], keep="first"
+    ).reset_index(drop=True)
     return df
 
 
 
 def crear_base_cruzada_maestra(df_historial, df_evaluatec):
-    """
-    Cruza Historial y EVALUATEC por nombre normalizado.
-    """
-
+    """Cruza Historial y EVALUATEC por nombre normalizado y carrera."""
     hist = df_historial.copy()
     eval_df = df_evaluatec.copy()
-
+    hist["Clave cruce maestra"] = hist["Nombre match"].fillna("").astype(str) + "||" + hist["Carrera match Historial"].fillna("").astype(str)
+    eval_df["Clave cruce maestra"] = eval_df["Nombre match"].fillna("").astype(str) + "||" + eval_df["Carrera match EVALUATEC"].fillna("").astype(str)
     hist = hist.add_prefix("hist_")
     eval_df = eval_df.add_prefix("eval_")
-
     df_cruzado = hist.merge(
-        eval_df,
-        left_on="hist_Nombre match",
-        right_on="eval_Nombre match",
-        how="outer",
-        indicator=True
+        eval_df, left_on="hist_Clave cruce maestra", right_on="eval_Clave cruce maestra",
+        how="outer", indicator=True
     )
 
-    df_cruzado["Nombre"] = df_cruzado[
-        "hist_Nombre completo Historial"
-    ].combine_first(
-        df_cruzado["eval_Nombre completo EVALUATEC"]
-    )
+    # Respaldo por nombre únicamente cuando es inequívoco en ambas fuentes.
+    hist_counts = hist["hist_Nombre match"].value_counts()
+    eval_counts = eval_df["eval_Nombre match"].value_counts()
+    eval_unicos = {
+        row["eval_Nombre match"]: row for _, row in eval_df.iterrows()
+        if eval_counts.get(row["eval_Nombre match"], 0) == 1
+    }
+    usados = set()
+    for idx in df_cruzado.index[df_cruzado["_merge"] == "left_only"]:
+        nombre = df_cruzado.at[idx, "hist_Nombre match"]
+        if hist_counts.get(nombre, 0) != 1 or nombre not in eval_unicos:
+            continue
+        row = eval_unicos[nombre]
+        clave = row["eval_Clave cruce maestra"]
+        if clave in usados:
+            continue
+        for col in eval_df.columns:
+            df_cruzado.at[idx, col] = row[col]
+        df_cruzado.at[idx, "_merge"] = "both"
+        usados.add(clave)
+    if usados:
+        df_cruzado = df_cruzado[~((df_cruzado["_merge"] == "right_only") & df_cruzado["eval_Clave cruce maestra"].isin(usados))].copy()
 
-    df_cruzado["Carrera Historial"] = df_cruzado[
-        "hist_Carrera historial"
-    ]
-
-    df_cruzado["Carrera EVALUATEC"] = df_cruzado[
-        "eval_Carrera EVALUATEC"
-    ]
-
-    df_cruzado["Carrera"] = df_cruzado[
-        "Carrera Historial"
-    ].combine_first(
-        df_cruzado["Carrera EVALUATEC"]
-    )
-
-    df_cruzado["Carrera match"] = df_cruzado[
-        "hist_Carrera match historial"
-    ].combine_first(
-        df_cruzado["eval_Carrera match EVALUATEC"]
-    )
-
+    df_cruzado["Nombre"] = df_cruzado["hist_Nombre completo Historial"].combine_first(df_cruzado["eval_Nombre completo EVALUATEC"])
+    df_cruzado["Carrera Historial"] = df_cruzado["hist_Carrera historial"]
+    df_cruzado["Carrera EVALUATEC"] = df_cruzado["eval_Carrera EVALUATEC"]
+    df_cruzado["Carrera"] = df_cruzado["Carrera Historial"].combine_first(df_cruzado["Carrera EVALUATEC"])
+    df_cruzado["Carrera match"] = df_cruzado["hist_Carrera match Historial"].combine_first(df_cruzado["eval_Carrera match EVALUATEC"])
     df_cruzado["Estatus cruce"] = np.select(
-        [
-            df_cruzado["_merge"] == "both",
-            df_cruzado["_merge"] == "left_only",
-            df_cruzado["_merge"] == "right_only"
-        ],
-        [
-            "Coincide en Historial y EVALUATEC",
-            "Solo en Historial",
-            "Solo en EVALUATEC"
-        ],
+        [df_cruzado["_merge"] == "both", df_cruzado["_merge"] == "left_only", df_cruzado["_merge"] == "right_only"],
+        ["Coincide en Historial y EVALUATEC", "Solo en Historial", "Solo en EVALUATEC"],
         default="Sin clasificar"
     )
+    df_cruzado["Carrera coincide Historial/EVALUATEC"] = df_cruzado["hist_Carrera match Historial"] == df_cruzado["eval_Carrera match EVALUATEC"]
+    df_cruzado.loc[(df_cruzado["_merge"] == "both") & (~df_cruzado["Carrera coincide Historial/EVALUATEC"].fillna(False)), "Estatus cruce"] = "Coincide por nombre, carrera distinta"
+    return df_cruzado.reset_index(drop=True)
 
-    df_cruzado["Carrera coincide Historial/EVALUATEC"] = (
-        df_cruzado["hist_Carrera match historial"]
-        ==
-        df_cruzado["eval_Carrera match EVALUATEC"]
-    )
-
-    df_cruzado.loc[
-        (
-            df_cruzado["_merge"] == "both"
-        )
-        &
-        (
-            df_cruzado["Carrera coincide Historial/EVALUATEC"] == False
-        ),
-        "Estatus cruce"
-    ] = "Coincide por nombre, carrera distinta"
-
-    return df_cruzado
 
 
 def extraer_correos_de_fila(fila):
@@ -2228,56 +2285,59 @@ def extraer_correos_historial_fila(fila):
     return list(set(correos))
     
 def buscar_chaside_para_estudiante(fila, df_chaside):
-    """
-    Busca CHASIDE únicamente por email del Historial.
-    Mucho más rápido que comparar por nombre y carrera.
-    """
-
+    """Busca CHASIDE por correo; si falla, usa nombre y carrera."""
     resultado_base = {
         "Diagnóstico CHASIDE": "Sin respuesta CHASIDE",
         "Carrera elegida CHASIDE": "Sin dato",
-        "Área fuerte CHASIDE 1": "Sin dato",
-        "Área fuerte CHASIDE 2": "Sin dato",
-        "Área débil CHASIDE 1": "Sin dato",
-        "Área débil CHASIDE 2": "Sin dato",
-        "Score CHASIDE": np.nan,
-        "Estatus cruce CHASIDE": "No encontrado por email en Historial"
+        "Área fuerte CHASIDE 1": "Sin dato", "Área fuerte CHASIDE 2": "Sin dato",
+        "Área débil CHASIDE 1": "Sin dato", "Área débil CHASIDE 2": "Sin dato",
+        "Score CHASIDE": np.nan, "Coincidencia perfil vocacional CHASIDE": np.nan,
+        "Estatus cruce CHASIDE": "No encontrado"
     }
-
     if df_chaside is None or df_chaside.empty:
         return resultado_base
+    base = df_chaside.copy()
+    for col in ["Correo Google CHASIDE", "Correo escrito CHASIDE"]:
+        if col not in base.columns:
+            base[col] = ""
+        base[col] = base[col].fillna("").apply(normalizar_correo)
+    if "Nombre match" not in base.columns:
+        col = util_encontrar_columna(base, ["Nombre completo CHASIDE", CHASIDE_COLUMNA_NOMBRE, "Nombre completo"])
+        base["Nombre match"] = base[col].apply(normalizar_nombre) if col is not None else ""
+    if "Carrera match CHASIDE" not in base.columns:
+        col = util_encontrar_columna(base, ["Carrera elegida CHASIDE", CHASIDE_COLUMNA_CARRERA, "Carrera"])
+        base["Carrera match CHASIDE"] = base[col].apply(simplificar_carrera) if col is not None else ""
 
-    correos_historial = extraer_correos_historial_fila(fila)
-
-    if not correos_historial:
+    match = pd.DataFrame(); estatus = ""
+    correos = extraer_correos_historial_fila(fila)
+    if correos:
+        match = base[base["Correo Google CHASIDE"].isin(correos) | base["Correo escrito CHASIDE"].isin(correos)].copy()
+        if not match.empty: estatus = "Coincide por correo"
+    nombre = str(valor_seguro(fila, "hist_Nombre match", "")).strip() or str(valor_seguro(fila, "eval_Nombre match", "")).strip()
+    carrera = str(valor_seguro(fila, "Carrera match", "")).strip()
+    if match.empty and nombre:
+        por_nombre = base[base["Nombre match"] == nombre].copy()
+        por_nombre_carrera = por_nombre[por_nombre["Carrera match CHASIDE"] == carrera].copy() if carrera else pd.DataFrame()
+        if not por_nombre_carrera.empty:
+            match = por_nombre_carrera; estatus = "Coincide por nombre y carrera"
+        elif len(por_nombre) == 1:
+            match = por_nombre; estatus = "Coincide por nombre único"
+    if match.empty:
         return resultado_base
-
-    df_match = df_chaside[
-        (
-            df_chaside["Correo Google CHASIDE"].fillna("").isin(correos_historial)
-        )
-        |
-        (
-            df_chaside["Correo escrito CHASIDE"].fillna("").isin(correos_historial)
-        )
-    ].copy()
-
-    if df_match.empty:
-        return resultado_base
-
-    mejor = df_match.iloc[0]
-
+    mejor = match.iloc[-1]
     return {
-        "Diagnóstico CHASIDE": mejor["Diagnóstico CHASIDE"],
-        "Carrera elegida CHASIDE": mejor["Carrera elegida CHASIDE"],
-        "Área fuerte CHASIDE 1": mejor["Área fuerte CHASIDE 1"],
-        "Área fuerte CHASIDE 2": mejor["Área fuerte CHASIDE 2"],
-        "Área débil CHASIDE 1": mejor["Área débil CHASIDE 1"],
-        "Área débil CHASIDE 2": mejor["Área débil CHASIDE 2"],
-        "Score CHASIDE": mejor["Score CHASIDE"],
-        "Estatus cruce CHASIDE": "Coincide por email en Historial"
+        "Diagnóstico CHASIDE": mejor.get("Diagnóstico CHASIDE", "Sin respuesta CHASIDE"),
+        "Carrera elegida CHASIDE": mejor.get("Carrera elegida CHASIDE", "Sin dato"),
+        "Área fuerte CHASIDE 1": mejor.get("Área fuerte CHASIDE 1", "Sin dato"),
+        "Área fuerte CHASIDE 2": mejor.get("Área fuerte CHASIDE 2", "Sin dato"),
+        "Área débil CHASIDE 1": mejor.get("Área débil CHASIDE 1", "Sin dato"),
+        "Área débil CHASIDE 2": mejor.get("Área débil CHASIDE 2", "Sin dato"),
+        "Score CHASIDE": mejor.get("Score CHASIDE", np.nan),
+        "Coincidencia perfil vocacional CHASIDE": mejor.get("Coincidencia perfil vocacional CHASIDE", np.nan),
+        "Estatus cruce CHASIDE": estatus
     }
-    
+
+
 def obtener_dos_areas_evaluatec(fila, tipo="fuerte"):
     """
     Obtiene dos áreas fuertes o débiles de EVALUATEC.
@@ -2354,10 +2414,6 @@ def generar_concentrado_maestro(
         )
     ]
 
-    st.write(
-        "Columnas de correo detectadas en Historial:",
-        columnas_correo_historial
-    )
 
     registros = []
 
@@ -2407,6 +2463,18 @@ def generar_concentrado_maestro(
                 fila,
                 "hist_Estatus promedio bachillerato"
             ),
+            "Propedéutico Ciencias Básicas": valor_seguro(
+                fila, "hist_Propedéutico Ciencias Básicas", np.nan
+            ),
+            "Propedéutico Departamento": valor_seguro(
+                fila, "hist_Propedéutico Departamento", np.nan
+            ),
+            "Promedio Propedéutico": valor_seguro(
+                fila, "hist_Promedio Propedéutico", np.nan
+            ),
+            "Nombre evaluación departamental": valor_seguro(
+                fila, "hist_Nombre evaluación departamental"
+            ),
             "Estatus inicio EVALUATEC": valor_seguro(
                 fila,
                 "eval_Estatus inicio EVALUATEC"
@@ -2427,6 +2495,9 @@ def generar_concentrado_maestro(
             "Área débil CHASIDE 1": resultado_chaside["Área débil CHASIDE 1"],
             "Área débil CHASIDE 2": resultado_chaside["Área débil CHASIDE 2"],
             "Score CHASIDE": resultado_chaside["Score CHASIDE"],
+            "Coincidencia CHASIDE": resultado_chaside[
+                "Coincidencia perfil vocacional CHASIDE"
+            ],
             "Estatus cruce CHASIDE": resultado_chaside["Estatus cruce CHASIDE"]
         }
 
@@ -2534,6 +2605,9 @@ def obtener_columnas_cluster(df):
     candidatas = [
         "Promedio bachillerato",
         "Resultado global EVALUATEC",
+        "Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento",
+        "Promedio Propedéutico",
         "Score CHASIDE",
         "Coincidencia CHASIDE"
     ]
@@ -2703,9 +2777,14 @@ def aplicar_clustering_por_carrera(df_maestro, random_state=42):
     - métricas de selección de k.
     """
     df = df_maestro.copy()
-    df["Coincidencia CHASIDE"] = df["Diagnóstico CHASIDE"].apply(
-        convertir_chaside_binario
-    )
+    if "Coincidencia CHASIDE" not in df.columns:
+        df["Coincidencia CHASIDE"] = df["Diagnóstico CHASIDE"].apply(
+            convertir_chaside_binario
+        )
+    else:
+        df["Coincidencia CHASIDE"] = pd.to_numeric(
+            df["Coincidencia CHASIDE"], errors="coerce"
+        )
 
     columnas_nuevas = {
         "Cluster": pd.Series(pd.NA, index=df.index, dtype="Int64"),
@@ -2801,6 +2880,12 @@ def aplicar_clustering_por_carrera(df_maestro, random_state=42):
                 "Promedio EVALUATEC": pd.to_numeric(
                     subgrupo["Resultado global EVALUATEC"], errors="coerce"
                 ).mean(),
+                "Promedio Propedéutico Ciencias Básicas": pd.to_numeric(
+                    subgrupo["Propedéutico Ciencias Básicas"], errors="coerce"
+                ).mean(),
+                "Promedio Propedéutico Departamento": pd.to_numeric(
+                    subgrupo["Propedéutico Departamento"], errors="coerce"
+                ).mean(),
                 "Coincidencia CHASIDE (%)": 100 * pd.to_numeric(
                     subgrupo["Coincidencia CHASIDE"], errors="coerce"
                 ).mean(),
@@ -2822,6 +2907,8 @@ def aplicar_clustering_por_carrera(df_maestro, random_state=42):
         columnas_redondeo = [
             "Promedio bachillerato",
             "Promedio EVALUATEC",
+            "Promedio Propedéutico Ciencias Básicas",
+            "Promedio Propedéutico Departamento",
             "Coincidencia CHASIDE (%)",
             "Silueta",
             "Davies-Bouldin"
@@ -2948,6 +3035,10 @@ def render_vista_clusters(df_maestro):
         "Nivel de atención",
         "Promedio bachillerato",
         "Resultado global EVALUATEC",
+        "Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento",
+        "Promedio Propedéutico",
+        "Coincidencia CHASIDE",
         "Diagnóstico CHASIDE",
         "Área débil EVALUATEC 1",
         "Área débil EVALUATEC 2",
@@ -3413,6 +3504,10 @@ def render_app_maestra():
         "Estatus cruce",
         "Promedio bachillerato",
         "Resultado global EVALUATEC",
+        "Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento",
+        "Promedio Propedéutico",
+        "Coincidencia CHASIDE",
         "Área débil EVALUATEC 1",
         "Área débil EVALUATEC 2",
         "Diagnóstico CHASIDE",
