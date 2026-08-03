@@ -902,13 +902,19 @@ def hist_normalizar_escuela_procedencia(valor):
 
 def hist_encontrar_nombre_historial(df):
     """
-    Detecta apellido paterno, apellido materno y nombre.
+    Detecta las columnas de nombre del Historial.
+
+    Devuelve apellido paterno, apellido materno y nombre cuando vienen
+    separados. Si el archivo usa una sola columna de nombre completo,
+    la devuelve como ``col_nombre`` y deja ambos apellidos en ``None``.
     """
 
     col_apellido_paterno = util_encontrar_columna(
         df,
         [
             "Apellido paterno",
+            "Apellido(s)",
+            "Apellidos",
             "Primer apellido",
             "Paterno"
         ]
@@ -932,6 +938,24 @@ def hist_encontrar_nombre_historial(df):
             "Nombre"
         ]
     )
+
+    # Algunos archivos actualizados concentran apellidos y nombres en una
+    # sola columna. Se reconoce antes de declarar que faltan encabezados.
+    col_nombre_completo = util_encontrar_columna(
+        df,
+        [
+            "Nombre completo",
+            "Nombre del aspirante",
+            "Nombre de aspirante",
+            "Aspirante",
+            "Nombre visible",
+            "Nombre completo historial",
+            "Nombre completo Historial"
+        ]
+    )
+
+    if col_apellido_paterno is None and col_nombre_completo is not None:
+        return None, None, col_nombre_completo
 
     return col_apellido_paterno, col_apellido_materno, col_nombre
 
@@ -1977,33 +2001,65 @@ def preparar_evaluatec_desde_bloques(datos_eval_global):
 def preparar_historial_para_cruce(df_historial):
     """
     Prepara historial para cruce maestro.
+
+    Tolera archivos con nombres en columnas separadas, una sola columna de
+    nombre completo o la columna normalizada creada previamente por
+    ``hist_procesar_hoja``.
     """
 
     df = df_historial.copy()
 
-    col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(
-        df
+    # El procesamiento previo ya suele crear esta columna. Se reutiliza para
+    # no depender nuevamente del formato exacto de los encabezados originales.
+    columna_nombre_preparada = util_encontrar_columna(
+        df,
+        [
+            "Nombre completo Historial",
+            "Nombre completo historial",
+            "Nombre visible",
+            "Nombre completo",
+            "Nombre del aspirante",
+            "Aspirante"
+        ]
     )
 
-    if col_apellido_paterno is None or col_nombre is None:
-        raise ValueError(
-            "No se identificaron columnas de apellido paterno y nombre en Historial."
+    if columna_nombre_preparada is not None:
+        df["Nombre completo Historial"] = df[
+            columna_nombre_preparada
+        ].fillna("").astype(str)
+    else:
+        col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(
+            df
         )
 
-    if col_apellido_materno is None:
-        df["Nombre completo Historial"] = (
-            df[col_apellido_paterno].fillna("").astype(str)
-            + " "
-            + df[col_nombre].fillna("").astype(str)
-        )
-    else:
-        df["Nombre completo Historial"] = (
-            df[col_apellido_paterno].fillna("").astype(str)
-            + " "
-            + df[col_apellido_materno].fillna("").astype(str)
-            + " "
-            + df[col_nombre].fillna("").astype(str)
-        )
+        # Formato con una sola columna de nombre completo.
+        if col_apellido_paterno is None and col_nombre is not None:
+            df["Nombre completo Historial"] = df[
+                col_nombre
+            ].fillna("").astype(str)
+
+        # Formato tradicional con apellido paterno + nombre.
+        elif col_apellido_paterno is not None and col_nombre is not None:
+            if col_apellido_materno is None:
+                df["Nombre completo Historial"] = (
+                    df[col_apellido_paterno].fillna("").astype(str)
+                    + " "
+                    + df[col_nombre].fillna("").astype(str)
+                )
+            else:
+                df["Nombre completo Historial"] = (
+                    df[col_apellido_paterno].fillna("").astype(str)
+                    + " "
+                    + df[col_apellido_materno].fillna("").astype(str)
+                    + " "
+                    + df[col_nombre].fillna("").astype(str)
+                )
+        else:
+            columnas_disponibles = ", ".join(map(str, df.columns[:25]))
+            raise ValueError(
+                "No se identificó una columna utilizable de nombre en Historial. "
+                "Encabezados detectados: " + columnas_disponibles
+            )
 
     df["Nombre completo Historial"] = df[
         "Nombre completo Historial"
