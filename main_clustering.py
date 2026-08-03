@@ -115,7 +115,7 @@ CHASIDE_COLUMNA_EMAIL_2 = "Escriba su correo electrónico"
 # LINKS PRECARGADOS EDITABLES
 # ============================================================
 
-LINK_HISTORIAL_DEFAULT = "https://docs.google.com/spreadsheets/d/1rthlRH1NiVCb7d5dr45mhQuC3We628ms/edit?usp=sharing&ouid=101744927034742701111&rtpof=true&sd=true"
+LINK_HISTORIAL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ad3Xi42BOU10TTO_ezQ6mi6APLY7kRMi/edit?usp=sharing&ouid=101744927034742701111&rtpof=true&sd=true"
 
 LINK_CHASIDE_DEFAULT = "https://docs.google.com/spreadsheets/d/1YHMEb5hftOZfV-CMWoUsUgJh1xmsgTY3YYwAtq1dGQA/edit?resourcekey=&gid=1491376423#gid=1491376423"
 
@@ -477,6 +477,78 @@ def valor_seguro(fila, columna, default="Sin dato"):
         return default
 
     return valor
+
+
+
+def diagnosticar_archivo_historial(contenido_archivo):
+    """
+    Inspecciona el archivo de Historial antes de procesarlo.
+
+    Devuelve:
+    - hojas encontradas;
+    - filas de encabezado detectadas por hoja;
+    - encabezados académicos visibles;
+    - número estimado de bloques por hoja.
+    """
+    archivo = io.BytesIO(contenido_archivo)
+    excel = pd.ExcelFile(archivo)
+
+    resumen = []
+
+    for hoja in excel.sheet_names:
+        df_crudo = pd.read_excel(
+            io.BytesIO(contenido_archivo),
+            sheet_name=hoja,
+            header=None,
+            dtype=object
+        )
+
+        filas_encabezados = hist_buscar_filas_encabezados(df_crudo)
+
+        if not filas_encabezados:
+            # Respaldo con el detector anterior.
+            fila_unica = hist_buscar_fila_encabezados(df_crudo)
+            filas_encabezados = (
+                [fila_unica] if fila_unica is not None else []
+            )
+
+        encabezados_academicos = []
+
+        for fila_encabezado in filas_encabezados:
+            encabezados = hist_nombres_unicos(
+                df_crudo.iloc[fila_encabezado].tolist()
+            )
+
+            for encabezado in encabezados:
+                limpio = util_limpiar_texto(encabezado)
+
+                if any(
+                    expresion in limpio
+                    for expresion in [
+                        "promedio",
+                        "escuela",
+                        "procedencia",
+                        "cal final",
+                        "calificacion",
+                        "basica",
+                        "0 al 100",
+                        "0 a 100"
+                    ]
+                ):
+                    encabezados_academicos.append(str(encabezado))
+
+        resumen.append({
+            "Hoja": hoja,
+            "Filas de encabezado detectadas": ", ".join(
+                str(indice + 1) for indice in filas_encabezados
+            ) if filas_encabezados else "Ninguna",
+            "Bloques detectados": len(filas_encabezados),
+            "Encabezados académicos detectados": " | ".join(
+                list(dict.fromkeys(encabezados_academicos))
+            ) if encabezados_academicos else "Ninguno"
+        })
+
+    return excel.sheet_names, pd.DataFrame(resumen)
 
 
 # ============================================================
@@ -2005,7 +2077,6 @@ def chaside_transformar_url_google_sheets(url):
         )
 
 
-@st.cache_data(show_spinner=False)
 def chaside_cargar_respuestas(url):
     """
     Carga respuestas CHASIDE desde Google Sheets.
@@ -3799,6 +3870,52 @@ def render_app_maestra():
                 )
                 st.stop()
 
+            # --------------------------------------------------------
+            # Diagnóstico visible de la fuente Historial
+            # --------------------------------------------------------
+            with st.expander(
+                "🔎 Diagnóstico de la fuente Historial",
+                expanded=True
+            ):
+                try:
+                    hojas_historial, diagnostico_historial = (
+                        diagnosticar_archivo_historial(
+                            contenido_historial
+                        )
+                    )
+
+                    st.write(
+                        "**Hojas encontradas:** "
+                        + ", ".join(map(str, hojas_historial))
+                    )
+
+                    st.dataframe(
+                        diagnostico_historial,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    if (
+                        len(hojas_historial) == 1
+                        and util_limpiar_texto(
+                            hojas_historial[0]
+                        ) == "concentrado maestro"
+                    ):
+                        st.error(
+                            "El enlace del Historial apunta a un archivo "
+                            "procesado con una sola hoja llamada "
+                            "'Concentrado maestro'. Debe apuntar al archivo "
+                            "original con una pestaña por carrera."
+                        )
+                        st.stop()
+
+                except Exception as error:
+                    st.error(
+                        "No fue posible inspeccionar el archivo de Historial: "
+                        f"{error}"
+                    )
+                    st.stop()
+
             archivos_evaluatec_finales = (
                 obtener_archivos_evaluatec_desde_links_o_uploads(
                     url_adm=url_evaluatec_adm,
@@ -3956,14 +4073,10 @@ def render_app_maestra():
                         "propedéuticas quedaron vacías. "
                         f"Ciencias Básicas recuperadas: {conteo_basicas}; "
                         f"departamentales recuperadas: {conteo_departamento}. "
-                        "Encabezados académicos detectados en Historial: "
-                        + (
-                            ", ".join(columnas_historial[:20])
-                            if columnas_historial
-                            else "ninguno"
-                        )
-                        + ". Carga manualmente el Excel corregido para verificar "
-                        "si el enlace de Historial apunta a una versión anterior."
+                        "Revisa el panel 'Diagnóstico de la fuente Historial' "
+                        "que aparece arriba. Ahí podrás confirmar las hojas, "
+                        "los bloques y los encabezados académicos realmente "
+                        "leídos desde el enlace o la carga manual."
                     )
 
                 # Se conserva la segmentación en los datos de salida,
