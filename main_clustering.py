@@ -7,7 +7,6 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
 
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
@@ -24,12 +23,6 @@ st.set_page_config(
     page_icon="🎓",
     layout="wide"
 )
-
-st.title("🎓 Super Base Integral de Aspirantes")
-st.caption(
-    "Integra Historial de Aspirantes, EVALUATEC y CHASIDE en un solo archivo Excel."
-)
-
 
 # ============================================================
 # CONSTANTES EVALUATEC
@@ -342,12 +335,12 @@ def obtener_contenido_historial_desde_link_o_upload(url_historial, archivo_histo
     Si el link está vacío, usa el archivo cargado manualmente.
     """
 
+    if archivo_historial is not None:
+        return archivo_historial.getvalue()
+
     if str(url_historial).strip() != "":
         url_descarga = transformar_link_google_sheets_xlsx(url_historial)
         return descargar_archivo_url(url_descarga)
-
-    if archivo_historial is not None:
-        return archivo_historial.getvalue()
 
     return None
 
@@ -359,9 +352,13 @@ def obtener_archivos_evaluatec_desde_links_o_uploads(
     archivos_evaluatec
 ):
     """
-    Usa links editables para los 3 CSV de EVALUATEC.
-    Si los links están vacíos, usa carga manual.
+    Obtiene los tres CSV de EVALUATEC.
+
+    Si el usuario carga archivos manualmente, se usan esos archivos.
+    En caso contrario, se descargan los links precargados/editables.
     """
+    if archivos_evaluatec:
+        return list(archivos_evaluatec)
 
     archivos_desde_links = []
 
@@ -372,7 +369,6 @@ def obtener_archivos_evaluatec_desde_links_o_uploads(
     ]
 
     for url, nombre_archivo in links:
-
         if str(url).strip() == "":
             continue
 
@@ -386,13 +382,9 @@ def obtener_archivos_evaluatec_desde_links_o_uploads(
             )
         )
 
-    if len(archivos_desde_links) > 0:
-        return archivos_desde_links
+    return archivos_desde_links
 
-    if archivos_evaluatec:
-        return archivos_evaluatec
 
-    return []
 
 def simplificar_carrera(valor):
     """
@@ -1009,59 +1001,109 @@ def hist_encontrar_nombre_historial(df):
     return col_apellido_paterno, col_apellido_materno, col_nombre
 
 
-def hist_procesar_hoja(contenido_archivo, nombre_hoja):
-    """
-    Procesa una hoja del Excel de Historial.
-    """
 
-    archivo = io.BytesIO(contenido_archivo)
+def hist_es_fila_encabezado(fila):
+    """
+    Determina si una fila corresponde a un encabezado real de participantes.
+    Se exige una combinación de ID, nombre/apellidos y alguna columna académica.
+    """
+    valores = [util_limpiar_texto(valor) for valor in list(fila)]
+    unidos = " | ".join(valores)
 
-    df_crudo = pd.read_excel(
-        archivo,
-        sheet_name=nombre_hoja,
-        header=None,
-        dtype=object
+    tiene_id = any(
+        expresion in unidos
+        for expresion in ["matricula/id", "matricula", "matrícula", " id "]
+    )
+    tiene_nombre = any(
+        expresion in unidos
+        for expresion in [
+            "apellido paterno", "apellido materno",
+            "nombre (s)", "nombre(s)", "nombres"
+        ]
+    )
+    tiene_academico = any(
+        expresion in unidos
+        for expresion in [
+            "promedio bachillerato", "escuela de procedencia", "cal final"
+        ]
     )
 
-    fila_encabezados = hist_buscar_fila_encabezados(df_crudo)
+    return bool(tiene_id and tiene_nombre and tiene_academico)
 
-    if fila_encabezados is None:
-        return None, {
-            "Hoja": nombre_hoja,
-            "Estatus": "No procesada",
-            "Detalle": "No se identificó una fila de encabezados."
-        }
 
-    carrera = hist_obtener_nombre_carrera(nombre_hoja, df_crudo)
+def hist_buscar_filas_encabezados(df_crudo):
+    """
+    Localiza todas las filas de encabezados de una hoja.
 
-    encabezados = hist_nombres_unicos(
-        df_crudo.iloc[fila_encabezados].tolist()
-    )
+    El archivo de Historial contiene varios grupos colocados verticalmente
+    dentro de la misma pestaña. Cada grupo vuelve a incluir sus encabezados;
+    por eso no debe procesarse únicamente el primer encabezado.
+    """
+    filas = []
 
-    df = df_crudo.iloc[fila_encabezados + 1:].copy()
-    df.columns = encabezados
-    df = df.dropna(how="all").copy()
+    for indice in range(len(df_crudo)):
+        if hist_es_fila_encabezado(df_crudo.iloc[indice].tolist()):
+            filas.append(indice)
+
+    return filas
+
+
+def hist_valor_realmente_vacio(valor):
+    """
+    Identifica una celda realmente vacía.
+
+    No considera vacías frases como 'no presentó', porque esas expresiones
+    deben transformarse en una calificación de cero.
+    """
+    if pd.isna(valor):
+        return True
+
+    texto = str(valor).replace("\xa0", " ").strip()
+
+    return texto == ""
+
+
+def hist_procesar_bloque(df_bloque, carrera, nombre_hoja, numero_bloque):
+    """
+    Procesa un bloque individual de participantes dentro de una pestaña.
+    """
+    if df_bloque is None or df_bloque.empty:
+        return pd.DataFrame()
+
+    df = df_bloque.dropna(how="all").copy()
 
     columna_id = util_encontrar_columna(
         df,
         [
-            "Matrícula/ID",
-            "Matricula/ID",
-            "Matrícula",
-            "Matricula",
-            "ID"
+            "Matrícula/ID", "Matricula/ID",
+            "Matrícula", "Matricula", "ID"
         ]
     )
 
-    if columna_id is not None:
-        df = df[df[columna_id].notna()].copy()
-        df["Matrícula/ID"] = df[columna_id]
-    else:
-        df["Matrícula/ID"] = "Sin dato"
+    if columna_id is None:
+        return pd.DataFrame()
 
+    # Quitar renglones decorativos, subtítulos y encabezados repetidos.
+    id_texto = df[columna_id].fillna("").astype(str).str.strip()
+    df = df[
+        df[columna_id].notna()
+        & (id_texto != "")
+        & (~id_texto.str.lower().isin(
+            {"matrícula/id", "matricula/id", "matrícula", "matricula", "id"}
+        ))
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df["Matrícula/ID"] = df[columna_id]
     df["Carrera historial"] = carrera
     df["Hoja historial"] = nombre_hoja
+    df["Bloque historial"] = numero_bloque
 
+    # --------------------------------------------------------
+    # Promedio de bachillerato
+    # --------------------------------------------------------
     columna_promedio = util_encontrar_columna(
         df,
         [
@@ -1072,85 +1114,128 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
     )
 
     if columna_promedio is not None:
-
         df["Promedio bachillerato original"] = df[columna_promedio]
-
         resultado = df[columna_promedio].apply(hist_convertir_promedio)
-
-        df["Promedio bachillerato 100"] = resultado.apply(
-            lambda x: x[0]
-        )
-
-        df["Estatus promedio bachillerato"] = resultado.apply(
-            lambda x: x[1]
-        )
-
+        df["Promedio bachillerato 100"] = resultado.apply(lambda x: x[0])
+        df["Estatus promedio bachillerato"] = resultado.apply(lambda x: x[1])
     else:
         df["Promedio bachillerato original"] = np.nan
         df["Promedio bachillerato 100"] = np.nan
-        df["Estatus promedio bachillerato"] = "No se encontró columna de promedio"
+        df["Estatus promedio bachillerato"] = (
+            "No se encontró columna de promedio"
+        )
 
     # --------------------------------------------------------
-    # Calificaciones del curso propedéutico
+    # Calificaciones del propedéutico
     # --------------------------------------------------------
-    columna_basicas, columna_departamento = hist_detectar_columnas_propedeutico(df)
+    columna_basicas, columna_departamento = (
+        hist_detectar_columnas_propedeutico(df)
+    )
 
     if columna_basicas is not None:
         resultado_basicas = df[columna_basicas].apply(
             hist_convertir_calificacion_propedeutico
         )
-        df["Propedéutico Ciencias Básicas"] = resultado_basicas.apply(lambda x: x[0])
-        df["Estatus Propedéutico Ciencias Básicas"] = resultado_basicas.apply(lambda x: x[1])
+        df["Propedéutico Ciencias Básicas"] = resultado_basicas.apply(
+            lambda x: x[0]
+        )
+        df["Estatus Propedéutico Ciencias Básicas"] = resultado_basicas.apply(
+            lambda x: x[1]
+        )
+        df["Columna origen Ciencias Básicas"] = str(columna_basicas)
     else:
         df["Propedéutico Ciencias Básicas"] = np.nan
-        df["Estatus Propedéutico Ciencias Básicas"] = "No se encontró columna"
+        df["Estatus Propedéutico Ciencias Básicas"] = (
+            "No se encontró columna"
+        )
+        df["Columna origen Ciencias Básicas"] = "No encontrada"
+
+    # La decisión de copiar Ciencias Básicas debe tomarse ANTES de convertir
+    # vacíos a cero. Así distinguimos una evaluación inexistente de un alumno
+    # que sí tenía columna, pero no presentó.
+    departamento_sin_datos = True
 
     if columna_departamento is not None:
+        departamento_sin_datos = df[columna_departamento].apply(
+            hist_valor_realmente_vacio
+        ).all()
+
+    if columna_departamento is None or departamento_sin_datos:
+        df["Propedéutico Departamento"] = (
+            df["Propedéutico Ciencias Básicas"]
+        )
+        df["Estatus Propedéutico Departamento"] = (
+            "Copiado de Ciencias Básicas: evaluación departamental sin datos"
+        )
+        df["Nombre evaluación departamental"] = (
+            "Sin calificación departamental; se usó Ciencias Básicas"
+        )
+        df["Columna origen Departamento"] = (
+            str(columna_departamento)
+            if columna_departamento is not None
+            else "No encontrada"
+        )
+    else:
         resultado_departamento = df[columna_departamento].apply(
             hist_convertir_calificacion_propedeutico
         )
-        df["Propedéutico Departamento"] = resultado_departamento.apply(lambda x: x[0])
-        df["Estatus Propedéutico Departamento"] = resultado_departamento.apply(lambda x: x[1])
+        df["Propedéutico Departamento"] = resultado_departamento.apply(
+            lambda x: x[0]
+        )
+        df["Estatus Propedéutico Departamento"] = (
+            resultado_departamento.apply(lambda x: x[1])
+        )
         df["Nombre evaluación departamental"] = str(columna_departamento)
-    else:
-        # Si toda la carrera carece de columna departamental, se usa Ciencias Básicas.
-        df["Propedéutico Departamento"] = df["Propedéutico Ciencias Básicas"]
-        df["Estatus Propedéutico Departamento"] = "Copiado de Ciencias Básicas"
-        df["Nombre evaluación departamental"] = "Sin columna propia; se usó Ciencias Básicas"
-
-    # Si la columna existe pero está completamente vacía en la hoja/grupo,
-    # también se toma Ciencias Básicas para conservar la regla acordada.
-    if df["Propedéutico Departamento"].notna().sum() == 0:
-        df["Propedéutico Departamento"] = df["Propedéutico Ciencias Básicas"]
-        df["Estatus Propedéutico Departamento"] = "Copiado de Ciencias Básicas"
+        df["Columna origen Departamento"] = str(columna_departamento)
 
     df["Promedio Propedéutico"] = df[
         ["Propedéutico Ciencias Básicas", "Propedéutico Departamento"]
-    ].mean(axis=1)
+    ].mean(axis=1, skipna=True)
 
-    col_apellido_paterno, col_apellido_materno, col_nombre = hist_encontrar_nombre_historial(df)
+    # --------------------------------------------------------
+    # Nombre completo
+    # --------------------------------------------------------
+    (
+        col_apellido_paterno,
+        col_apellido_materno,
+        col_nombre
+    ) = hist_encontrar_nombre_historial(df)
 
     if col_apellido_paterno is None and col_nombre is not None:
-        df["Nombre completo historial"] = df[col_nombre].fillna("").astype(str)
+        df["Nombre completo historial"] = (
+            df[col_nombre].fillna("").astype(str)
+        )
     elif col_apellido_paterno is not None and col_nombre is not None:
-        if col_apellido_materno is None:
-            df["Nombre completo historial"] = (
-                df[col_apellido_paterno].fillna("").astype(str) + " " + df[col_nombre].fillna("").astype(str)
+        partes = [df[col_apellido_paterno].fillna("").astype(str)]
+
+        if col_apellido_materno is not None:
+            partes.append(
+                df[col_apellido_materno].fillna("").astype(str)
             )
-        else:
-            df["Nombre completo historial"] = (
-                df[col_apellido_paterno].fillna("").astype(str) + " "
-                + df[col_apellido_materno].fillna("").astype(str) + " "
-                + df[col_nombre].fillna("").astype(str)
-            )
+
+        partes.append(df[col_nombre].fillna("").astype(str))
+
+        nombre_completo = partes[0]
+        for parte in partes[1:]:
+            nombre_completo = nombre_completo + " " + parte
+
+        df["Nombre completo historial"] = nombre_completo
     else:
         df["Nombre completo historial"] = ""
 
-    df["Nombre visible"] = df["Nombre completo historial"].apply(nombre_visible)
-    df["Nombre match"] = df["Nombre completo historial"].apply(normalizar_nombre)
+    df["Nombre visible"] = df["Nombre completo historial"].apply(
+        nombre_visible
+    )
+    df["Nombre match"] = df["Nombre completo historial"].apply(
+        normalizar_nombre
+    )
+    df["Carrera match historial"] = df["Carrera historial"].apply(
+        simplificar_carrera
+    )
 
-    df["Carrera match historial"] = df["Carrera historial"].apply(simplificar_carrera)
-
+    # --------------------------------------------------------
+    # Sexo
+    # --------------------------------------------------------
     columna_sexo = util_encontrar_columna(
         df,
         ["Género", "Genero", "Sexo"]
@@ -1161,6 +1246,9 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
     else:
         df["Sexo"] = "Sin especificar"
 
+    # --------------------------------------------------------
+    # Escuela y estado de procedencia
+    # --------------------------------------------------------
     columna_escuela = util_encontrar_columna(
         df,
         [
@@ -1172,19 +1260,17 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
     )
 
     if columna_escuela is not None:
-
-        df["Escuela de procedencia original"] = df[
-            columna_escuela
-        ].fillna("Sin dato").astype(str)
-
-        df["Escuela de procedencia normalizada"] = df[
-            columna_escuela
-        ].apply(hist_normalizar_escuela_procedencia)
-
-        df["Estado de procedencia"] = df[
-            columna_escuela
-        ].apply(hist_clasificar_estado_procedencia)
-
+        df["Escuela de procedencia original"] = (
+            df[columna_escuela].fillna("Sin dato").astype(str)
+        )
+        df["Escuela de procedencia normalizada"] = (
+            df[columna_escuela].apply(
+                hist_normalizar_escuela_procedencia
+            )
+        )
+        df["Estado de procedencia"] = df[columna_escuela].apply(
+            hist_clasificar_estado_procedencia
+        )
     else:
         df["Escuela de procedencia original"] = "Sin dato"
         df["Escuela de procedencia normalizada"] = "Sin dato"
@@ -1196,16 +1282,92 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
 
     df = df[
         df["Nombre match"].notna()
-        &
-        (df["Nombre match"].astype(str).str.strip() != "")
-        &
-        (~df["Nombre match"].astype(str).str.contains("AULA", na=False))
+        & (df["Nombre match"].astype(str).str.strip() != "")
+        & (~df["Nombre match"].astype(str).str.contains("AULA", na=False))
+        & (~df["Nombre match"].astype(str).str.contains(
+            "APELLIDO PATERNO", na=False
+        ))
     ].copy()
 
-    return df, {
+    return df
+
+
+def hist_procesar_hoja(contenido_archivo, nombre_hoja):
+    """
+    Procesa todos los grupos contenidos en una hoja del Historial.
+    """
+    archivo = io.BytesIO(contenido_archivo)
+
+    df_crudo = pd.read_excel(
+        archivo,
+        sheet_name=nombre_hoja,
+        header=None,
+        dtype=object
+    )
+
+    filas_encabezados = hist_buscar_filas_encabezados(df_crudo)
+
+    if not filas_encabezados:
+        return None, {
+            "Hoja": nombre_hoja,
+            "Estatus": "No procesada",
+            "Detalle": "No se identificaron encabezados de participantes."
+        }
+
+    carrera = hist_obtener_nombre_carrera(nombre_hoja, df_crudo)
+    bloques = []
+
+    for posicion, fila_encabezado in enumerate(
+        filas_encabezados, start=1
+    ):
+        siguiente = (
+            filas_encabezados[posicion]
+            if posicion < len(filas_encabezados)
+            else len(df_crudo)
+        )
+
+        encabezados = hist_nombres_unicos(
+            df_crudo.iloc[fila_encabezado].tolist()
+        )
+
+        df_bloque = df_crudo.iloc[
+            fila_encabezado + 1:siguiente
+        ].copy()
+        df_bloque.columns = encabezados
+
+        procesado = hist_procesar_bloque(
+            df_bloque=df_bloque,
+            carrera=carrera,
+            nombre_hoja=nombre_hoja,
+            numero_bloque=posicion
+        )
+
+        if procesado is not None and not procesado.empty:
+            bloques.append(procesado)
+
+    if not bloques:
+        return None, {
+            "Hoja": nombre_hoja,
+            "Estatus": "No procesada",
+            "Detalle": (
+                f"Se detectaron {len(filas_encabezados)} bloques, "
+                "pero ninguno contenía participantes válidos."
+            )
+        }
+
+    df_hoja = pd.concat(
+        bloques,
+        ignore_index=True,
+        sort=False
+    )
+
+    return df_hoja, {
         "Hoja": nombre_hoja,
         "Estatus": "Procesada",
-        "Detalle": f"{len(df):,} aspirantes identificados."
+        "Detalle": (
+            f"{len(df_hoja):,} aspirantes identificados "
+            f"en {len(bloques)} bloques."
+        )
     }
 
 
@@ -3273,136 +3435,6 @@ def aplicar_clustering_por_carrera(df_maestro, random_state=42):
     return df, df_resumen, df_metricas
 
 
-def render_vista_clusters(df_maestro):
-    """Vista Streamlit con donut seleccionable y lista nominal."""
-    st.markdown("## Segmentación académica por carrera")
-    st.caption(
-        "Selecciona una porción del gráfico para consultar la lista nominal. "
-        "Los dos perfiles con menor desempeño quedan marcados como prioritarios; "
-        "la canalización final corresponde a coordinación."
-    )
-
-    carreras = sorted(
-        df_maestro.loc[
-            df_maestro["Perfil académico"] != "Datos insuficientes para segmentar",
-            "Carrera"
-        ].dropna().astype(str).unique().tolist()
-    )
-
-    if not carreras:
-        st.info("No hay carreras con información suficiente para generar clusters.")
-        return
-
-    carrera = st.selectbox(
-        "Carrera",
-        carreras,
-        key="selector_carrera_cluster"
-    )
-
-    df_carrera = df_maestro[df_maestro["Carrera"].astype(str) == carrera].copy()
-    resumen = (
-        df_carrera.groupby(
-            ["Perfil académico", "Orden de prioridad", "Nivel de atención"],
-            dropna=False
-        )
-        .size()
-        .reset_index(name="Estudiantes")
-        .sort_values("Orden de prioridad")
-    )
-
-    fig = px.pie(
-        resumen,
-        names="Perfil académico",
-        values="Estudiantes",
-        hole=0.58,
-        custom_data=["Orden de prioridad", "Nivel de atención"]
-    )
-    fig.update_traces(
-        textinfo="percent+label",
-        hovertemplate=(
-            "<b>%{label}</b><br>"
-            "Estudiantes: %{value}<br>"
-            "Porcentaje: %{percent}<extra></extra>"
-        )
-    )
-    fig.update_layout(
-        title=f"Distribución de perfiles — {carrera}",
-        legend_title_text="Perfil",
-        margin=dict(t=70, b=20, l=20, r=20)
-    )
-
-    evento = st.plotly_chart(
-        fig,
-        use_container_width=True,
-        key=f"donut_clusters_{util_limpiar_texto(carrera)}",
-        on_select="rerun",
-        selection_mode="points"
-    )
-
-    perfil_seleccionado = None
-    try:
-        puntos = evento.selection.points
-        if puntos:
-            perfil_seleccionado = puntos[0].get("label")
-    except Exception:
-        perfil_seleccionado = None
-
-    perfiles = resumen["Perfil académico"].tolist()
-    if perfil_seleccionado not in perfiles:
-        perfiles_prioritarios = resumen.loc[
-            resumen["Orden de prioridad"].isin([1, 2]),
-            "Perfil académico"
-        ].tolist()
-        perfil_seleccionado = st.selectbox(
-            "Perfil a consultar",
-            perfiles,
-            index=0,
-            help=(
-                "También puedes elegirlo aquí. Los perfiles prioritarios son: "
-                + ", ".join(perfiles_prioritarios)
-            )
-        )
-    else:
-        st.success(f"Perfil seleccionado en el gráfico: {perfil_seleccionado}")
-
-    lista = df_carrera[
-        df_carrera["Perfil académico"] == perfil_seleccionado
-    ].copy()
-    lista = lista.sort_values(
-        ["Distancia al centroide", "Resultado global EVALUATEC"],
-        ascending=[True, True]
-    )
-
-    st.markdown(f"### Lista nominal — {perfil_seleccionado}")
-
-    columnas_lista = [
-        "Matrícula/ID",
-        "Nombre",
-        "Carrera",
-        "Nivel de atención",
-        "Promedio bachillerato",
-        "Resultado global EVALUATEC",
-        "Propedéutico Ciencias Básicas",
-        "Propedéutico Departamento",
-        "Promedio Propedéutico",
-        "Coincidencia CHASIDE",
-        "Diagnóstico CHASIDE",
-        "Área débil EVALUATEC 1",
-        "Área débil EVALUATEC 2",
-        "Área débil CHASIDE 1",
-        "Área débil CHASIDE 2",
-        "Distancia al centroide",
-        "Canalización determinada por coordinación",
-        "Observaciones de coordinación"
-    ]
-    columnas_lista = [c for c in columnas_lista if c in lista.columns]
-
-    st.dataframe(
-        lista[columnas_lista],
-        use_container_width=True,
-        hide_index=True
-    )
-
 # ============================================================
 # EXCEL MAESTRO
 # ============================================================
@@ -3573,19 +3605,27 @@ def generar_excel_maestro(df_maestro):
 # ============================================================
 
 def render_app_maestra():
+    """
+    Interfaz mínima del generador.
+
+    Solo muestra:
+    - links y opciones de carga manual;
+    - botón para generar;
+    - descarga del Excel maestro.
+
+    El clustering se calcula y se guarda en el archivo, pero no se presenta
+    visualmente en Streamlit.
+    """
     st.title("📚 Generador de Concentrado Maestro de Aspirantes")
 
     st.caption(
-        "Integra Historial de Aspirantes, EVALUATEC y CHASIDE en una sola base "
-        "sin aplicar boxplot. El archivo resultante puede alimentar una app HTML "
-        "para consulta docente."
+        "Integra Historial de Aspirantes, EVALUATEC y CHASIDE "
+        "en un único archivo Excel para alimentar el dashboard HTML."
     )
 
-    st.markdown("## 1. Carga de archivos")
-
     st.info(
-        "Puedes usar los links precargados o sustituirlos por nuevos enlaces. "
-        "Si prefieres carga manual, borra los links correspondientes y carga los archivos."
+        "Puedes conservar los enlaces precargados o reemplazarlos. "
+        "Cuando cargas un archivo manualmente, la carga manual tiene prioridad."
     )
 
     st.markdown("### Historial de Aspirantes")
@@ -3597,7 +3637,7 @@ def render_app_maestra():
     )
 
     archivo_historial = st.file_uploader(
-        "O carga manualmente el Excel de Historial de Aspirantes",
+        "Carga manual opcional del Historial de Aspirantes",
         type=["xlsx", "xls"],
         key="archivo_historial_maestro"
     )
@@ -3628,7 +3668,7 @@ def render_app_maestra():
         )
 
     archivos_evaluatec = st.file_uploader(
-        "O carga manualmente los 3 archivos CSV de EVALUATEC",
+        "Carga manual opcional de los 3 CSV de EVALUATEC",
         type=["csv"],
         accept_multiple_files=True,
         key="archivos_evaluatec_maestro"
@@ -3654,7 +3694,7 @@ def render_app_maestra():
     peso_aptitudes = round(1 - peso_intereses, 2)
 
     st.caption(
-        f"Pesos CHASIDE activos → Intereses: {peso_intereses:.1f} | "
+        f"Intereses: {peso_intereses:.1f} · "
         f"Aptitudes: {peso_aptitudes:.1f}"
     )
 
@@ -3662,245 +3702,195 @@ def render_app_maestra():
 
     boton_generar = st.button(
         "🚀 Generar concentrado maestro",
-        use_container_width=True
+        use_container_width=True,
+        type="primary"
     )
-
-    if not boton_generar and "df_maestro" not in st.session_state:
-        st.info(
-            "Carga los archivos o conserva los links precargados y presiona el botón para generar la super base."
-        )
-        st.stop()
 
     if boton_generar:
-
-        contenido_historial = obtener_contenido_historial_desde_link_o_upload(
-            url_historial=url_historial,
-            archivo_historial=archivo_historial
-        )
-
-        if contenido_historial is None:
-            st.error("Falta cargar o indicar el link del Historial de Aspirantes.")
-            st.stop()
-
-        archivos_evaluatec_finales = obtener_archivos_evaluatec_desde_links_o_uploads(
-            url_adm=url_evaluatec_adm,
-            url_arq=url_evaluatec_arq,
-            url_ing=url_evaluatec_ing,
-            archivos_evaluatec=archivos_evaluatec
-        )
-
-        if not archivos_evaluatec_finales or len(archivos_evaluatec_finales) != 3:
-            st.error(
-                "Debes tener exactamente 3 archivos de EVALUATEC. "
-                "Puedes usar los 3 links precargados o cargar los 3 CSV manualmente."
-            )
-            st.stop()
-
-        if url_chaside.strip() == "":
-            st.warning(
-                "No pegaste enlace CHASIDE. El concentrado se generará sin resultados vocacionales."
+        try:
+            contenido_historial = (
+                obtener_contenido_historial_desde_link_o_upload(
+                    url_historial=url_historial,
+                    archivo_historial=archivo_historial
+                )
             )
 
-        # ------------------------------------------------------------
-        # Procesamiento Historial
-        # ------------------------------------------------------------
-
-        with st.spinner("Procesando Historial de Aspirantes..."):
-            df_historial_raw, df_bitacora = procesar_archivo_historial_excel(
-                contenido_historial
-            )
-
-            if df_historial_raw.empty:
-                st.error("No se pudieron identificar estudiantes en el Historial.")
-                st.dataframe(df_bitacora, use_container_width=True)
+            if contenido_historial is None:
+                st.error(
+                    "Falta cargar o indicar el link del Historial."
+                )
                 st.stop()
 
-            df_historial_preparado = preparar_historial_para_cruce(
-                df_historial_raw
+            archivos_evaluatec_finales = (
+                obtener_archivos_evaluatec_desde_links_o_uploads(
+                    url_adm=url_evaluatec_adm,
+                    url_arq=url_evaluatec_arq,
+                    url_ing=url_evaluatec_ing,
+                    archivos_evaluatec=archivos_evaluatec
+                )
             )
 
-        # ------------------------------------------------------------
-        # Procesamiento EVALUATEC
-        # ------------------------------------------------------------
-
-        with st.spinner("Procesando archivos EVALUATEC..."):
-            datos_eval_global = {}
-            errores_eval = []
-
-            for archivo in archivos_evaluatec_finales:
-                try:
-                    df_eval, areas_detectadas = procesar_archivo_evaluatec(
-                        archivo
-                    )
-
-                    bloque = df_eval["Bloque EVALUATEC"].iloc[0]
-
-                    datos_eval_global[bloque] = {
-                        "df": df_eval,
-                        "areas": areas_detectadas,
-                        "archivo": archivo.name
-                    }
-
-                except Exception as error:
-                    errores_eval.append(
-                        f"{archivo.name}: {error}"
-                    )
-
-            if errores_eval:
-                for error in errores_eval:
-                    st.warning(error)
-
-            if not datos_eval_global:
-                st.error("No se pudo procesar ningún archivo EVALUATEC.")
+            if len(archivos_evaluatec_finales) != 3:
+                st.error(
+                    "Se requieren exactamente 3 CSV de EVALUATEC."
+                )
                 st.stop()
 
-            df_evaluatec_preparado = preparar_evaluatec_desde_bloques(
-                datos_eval_global
+            with st.spinner("Procesando Historial de Aspirantes..."):
+                df_historial_raw, df_bitacora = (
+                    procesar_archivo_historial_excel(
+                        contenido_historial
+                    )
+                )
+
+                if df_historial_raw.empty:
+                    st.error(
+                        "No se identificaron estudiantes en el Historial."
+                    )
+                    st.stop()
+
+                df_historial_preparado = (
+                    preparar_historial_para_cruce(
+                        df_historial_raw
+                    )
+                )
+
+            with st.spinner("Procesando EVALUATEC..."):
+                datos_eval_global = {}
+                errores_eval = []
+
+                for archivo in archivos_evaluatec_finales:
+                    try:
+                        df_eval, areas_detectadas = (
+                            procesar_archivo_evaluatec(archivo)
+                        )
+
+                        bloque = df_eval[
+                            "Bloque EVALUATEC"
+                        ].iloc[0]
+
+                        datos_eval_global[bloque] = {
+                            "df": df_eval,
+                            "areas": areas_detectadas,
+                            "archivo": archivo.name
+                        }
+                    except Exception as error:
+                        errores_eval.append(
+                            f"{archivo.name}: {error}"
+                        )
+
+                if errores_eval:
+                    for error in errores_eval:
+                        st.warning(error)
+
+                if len(datos_eval_global) != 3:
+                    st.error(
+                        "No se procesaron correctamente los tres "
+                        "bloques EVALUATEC."
+                    )
+                    st.stop()
+
+                df_evaluatec_preparado = (
+                    preparar_evaluatec_desde_bloques(
+                        datos_eval_global
+                    )
+                )
+
+            if url_chaside.strip():
+                with st.spinner("Procesando CHASIDE..."):
+                    try:
+                        df_chaside_raw = cargar_respuestas_chaside(
+                            url_chaside
+                        )
+                        df_chaside_procesado = (
+                            procesar_respuestas_chaside(
+                                df_chaside_raw,
+                                peso_intereses=peso_intereses,
+                                peso_aptitudes=peso_aptitudes
+                            )
+                        )
+                    except Exception as error:
+                        st.warning(
+                            "CHASIDE no pudo procesarse. "
+                            f"El archivo se generará sin esa fuente. {error}"
+                        )
+                        df_chaside_procesado = pd.DataFrame()
+            else:
+                df_chaside_procesado = pd.DataFrame()
+
+            with st.spinner("Construyendo el Concentrado maestro..."):
+                df_maestro = generar_concentrado_maestro(
+                    df_historial_preparado=df_historial_preparado,
+                    df_evaluatec_preparado=df_evaluatec_preparado,
+                    df_chaside_procesado=df_chaside_procesado
+                )
+
+                if df_maestro.empty:
+                    st.error(
+                        "El Concentrado maestro quedó vacío."
+                    )
+                    st.stop()
+
+                # Se conserva la segmentación en los datos de salida,
+                # aunque ya no se muestra dentro de Streamlit.
+                (
+                    df_maestro,
+                    df_resumen_clusters,
+                    df_metricas_clusters
+                ) = aplicar_clustering_por_carrera(df_maestro)
+
+                st.session_state["df_maestro"] = (
+                    df_maestro.copy()
+                )
+                st.session_state["df_resumen_clusters"] = (
+                    df_resumen_clusters.copy()
+                )
+                st.session_state["df_metricas_clusters"] = (
+                    df_metricas_clusters.copy()
+                )
+
+                archivo_excel = generar_excel_maestro(
+                    df_maestro
+                )
+                st.session_state[
+                    "archivo_excel_maestro"
+                ] = archivo_excel
+
+            # Control mínimo, sin vista previa ni gráficas.
+            total_prop_basicas = pd.to_numeric(
+                df_maestro["Propedéutico Ciencias Básicas"],
+                errors="coerce"
+            ).notna().sum()
+
+            total_prop_departamento = pd.to_numeric(
+                df_maestro["Propedéutico Departamento"],
+                errors="coerce"
+            ).notna().sum()
+
+            st.success(
+                "Concentrado generado correctamente: "
+                f"{len(df_maestro):,} registros. "
+                f"Ciencias Básicas recuperadas: {total_prop_basicas:,}. "
+                f"Evaluaciones departamentales recuperadas: "
+                f"{total_prop_departamento:,}."
             )
 
-            if df_evaluatec_preparado.empty:
-                st.error("EVALUATEC se cargó, pero no se pudo preparar para cruce.")
-                st.stop()
-
-        # ------------------------------------------------------------
-        # Procesamiento CHASIDE
-        # ------------------------------------------------------------
-
-        if url_chaside.strip() != "":
-            with st.spinner("Procesando CHASIDE..."):
-                try:
-                    df_chaside_raw = cargar_respuestas_chaside(
-                        url_chaside
-                    )
-
-                    df_chaside_procesado = procesar_respuestas_chaside(
-                        df_chaside_raw,
-                        peso_intereses=peso_intereses,
-                        peso_aptitudes=peso_aptitudes
-                    )
-
-                except Exception as error:
-                    st.warning(
-                        f"No fue posible procesar CHASIDE. Se continuará sin CHASIDE. Detalle: {error}"
-                    )
-                    df_chaside_procesado = pd.DataFrame()
-        else:
-            df_chaside_procesado = pd.DataFrame()
-
-        # ------------------------------------------------------------
-        # Concentrado maestro
-        # ------------------------------------------------------------
-
-        with st.spinner("Generando concentrado maestro..."):
-            df_maestro = generar_concentrado_maestro(
-                df_historial_preparado=df_historial_preparado,
-                df_evaluatec_preparado=df_evaluatec_preparado,
-                df_chaside_procesado=df_chaside_procesado
-            )
-
-        if df_maestro.empty:
-            st.error("No se pudo generar el concentrado maestro.")
-            st.stop()
-
-        with st.spinner("Aplicando clustering académico por carrera..."):
-            df_maestro, df_resumen_clusters, df_metricas_clusters = (
-                aplicar_clustering_por_carrera(df_maestro)
-            )
-
-        st.session_state["df_maestro"] = df_maestro.copy()
-        st.session_state["df_resumen_clusters"] = df_resumen_clusters.copy()
-        st.session_state["df_metricas_clusters"] = df_metricas_clusters.copy()
-
-        if "archivo_excel_maestro" in st.session_state:
-            del st.session_state["archivo_excel_maestro"]
-
-    df_maestro = st.session_state["df_maestro"].copy()
-
-    # ------------------------------------------------------------
-    # Vista ejecutiva
-    # ------------------------------------------------------------
-
-    st.success(
-        f"Concentrado maestro generado correctamente: {len(df_maestro):,} estudiantes."
-    )
-
-    total_estudiantes = len(df_maestro)
-    total_carreras = df_maestro["Carrera"].dropna().nunique()
-
-    con_evaluatec = df_maestro[
-        df_maestro["Resultado global EVALUATEC"].notna()
-    ].shape[0]
-
-    con_chaside = df_maestro[
-        df_maestro["Diagnóstico CHASIDE"] != "Sin respuesta CHASIDE"
-    ].shape[0]
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Estudiantes", f"{total_estudiantes:,}")
-    col2.metric("Carreras", f"{total_carreras:,}")
-    col3.metric("Con EVALUATEC", f"{con_evaluatec:,}")
-    col4.metric("Con CHASIDE", f"{con_chaside:,}")
-
-    st.markdown("## Vista previa del concentrado")
-
-    columnas_vista = [
-        "Nombre",
-        "Matrícula/ID",
-        "Carrera",
-        "Estatus cruce",
-        "Promedio bachillerato",
-        "Resultado global EVALUATEC",
-        "Propedéutico Ciencias Básicas",
-        "Propedéutico Departamento",
-        "Promedio Propedéutico",
-        "Coincidencia CHASIDE",
-        "Área débil EVALUATEC 1",
-        "Área débil EVALUATEC 2",
-        "Diagnóstico CHASIDE",
-        "Estatus cruce CHASIDE",
-        "Perfil académico",
-        "Nivel de atención",
-        "Atender prioritariamente"
-    ]
-
-    columnas_vista = [
-        columna
-        for columna in columnas_vista
-        if columna in df_maestro.columns
-    ]
-
-    st.dataframe(
-        df_maestro[columnas_vista],
-        use_container_width=True,
-        hide_index=True
-    )
-
-    render_vista_clusters(df_maestro)
-
-    # ------------------------------------------------------------
-    # Descarga
-    # ------------------------------------------------------------
-
-    st.markdown("## Descarga")
-
-    if st.button(
-        "📄 Preparar archivo Excel",
-        use_container_width=True
-    ):
-        with st.spinner("Preparando Excel maestro..."):
-            archivo_excel = generar_excel_maestro(df_maestro)
-
-        st.session_state["archivo_excel_maestro"] = archivo_excel
+        except Exception as error:
+            st.exception(error)
 
     if "archivo_excel_maestro" in st.session_state:
         st.download_button(
             label="⬇️ Descargar concentrado maestro en Excel",
             data=st.session_state["archivo_excel_maestro"],
             file_name="concentrado_maestro_aspirantes.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
             use_container_width=True
         )
+
+
 # ============================================================
 # COMPATIBILIDAD DE NOMBRES
 # ============================================================
@@ -3959,7 +3949,6 @@ def validar_funciones_requeridas():
         "preparar_evaluatec_desde_bloques",
         "generar_concentrado_maestro",
         "aplicar_clustering_por_carrera",
-        "render_vista_clusters",
         "generar_excel_maestro",
         "render_app_maestra"
     ]
