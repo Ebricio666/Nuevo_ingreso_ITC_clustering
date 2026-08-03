@@ -2057,6 +2057,19 @@ def chaside_procesar_respuestas(
 # CRUCE MAESTRO
 # ============================================================
 
+def crear_clave_nombre_por_tokens(valor):
+    """Crea una clave de nombre robusta al orden de nombres y apellidos.
+
+    Ejemplo: "Álvarez Arroyo Víctor Manuel" y
+    "Víctor Manuel Álvarez Arroyo" producen la misma clave.
+    """
+    nombre = normalizar_nombre(valor)
+    if nombre is None:
+        return ""
+    tokens = [t for t in str(nombre).split() if t]
+    return " ".join(sorted(tokens))
+
+
 def preparar_evaluatec_desde_bloques(datos_eval_global):
     """
     Integra los 3 bloques EVALUATEC en una sola base.
@@ -2080,6 +2093,9 @@ def preparar_evaluatec_desde_bloques(datos_eval_global):
         df_temp["Nombre match"] = df_temp[
             columna_nombre
         ].apply(normalizar_nombre)
+        df_temp["Nombre tokens match"] = df_temp[
+            columna_nombre
+        ].apply(crear_clave_nombre_por_tokens)
 
         df_temp["Carrera match EVALUATEC"] = df_temp[
             "Carrera EVALUATEC"
@@ -2140,6 +2156,9 @@ def preparar_historial_para_cruce(df_historial):
 
     df["Nombre completo Historial"] = df["Nombre completo Historial"].apply(nombre_visible)
     df["Nombre match"] = df["Nombre completo Historial"].apply(normalizar_nombre)
+    df["Nombre tokens match"] = df["Nombre completo Historial"].apply(
+        crear_clave_nombre_por_tokens
+    )
     df = df[
         df["Nombre match"].notna()
         & (df["Nombre match"].astype(str).str.strip() != "")
@@ -2185,53 +2204,178 @@ def preparar_historial_para_cruce(df_historial):
 
 
 def crear_base_cruzada_maestra(df_historial, df_evaluatec):
-    """Cruza Historial y EVALUATEC por nombre normalizado y carrera."""
+    """Cruza Historial y EVALUATEC con varias llaves seguras.
+
+    Orden de vinculación:
+    1. Nombre normalizado + carrera.
+    2. Palabras del nombre, sin importar su orden + carrera.
+    3. Nombre exacto único.
+    4. Palabras del nombre únicas.
+    """
     hist = df_historial.copy()
     eval_df = df_evaluatec.copy()
-    hist["Clave cruce maestra"] = hist["Nombre match"].fillna("").astype(str) + "||" + hist["Carrera match Historial"].fillna("").astype(str)
-    eval_df["Clave cruce maestra"] = eval_df["Nombre match"].fillna("").astype(str) + "||" + eval_df["Carrera match EVALUATEC"].fillna("").astype(str)
+
+    if "Nombre tokens match" not in hist.columns:
+        hist["Nombre tokens match"] = hist["Nombre match"].apply(
+            crear_clave_nombre_por_tokens
+        )
+    if "Nombre tokens match" not in eval_df.columns:
+        eval_df["Nombre tokens match"] = eval_df["Nombre match"].apply(
+            crear_clave_nombre_por_tokens
+        )
+
+    hist["Clave cruce maestra"] = (
+        hist["Nombre match"].fillna("").astype(str)
+        + "||"
+        + hist["Carrera match Historial"].fillna("").astype(str)
+    )
+    eval_df["Clave cruce maestra"] = (
+        eval_df["Nombre match"].fillna("").astype(str)
+        + "||"
+        + eval_df["Carrera match EVALUATEC"].fillna("").astype(str)
+    )
+    hist["Clave tokens carrera"] = (
+        hist["Nombre tokens match"].fillna("").astype(str)
+        + "||"
+        + hist["Carrera match Historial"].fillna("").astype(str)
+    )
+    eval_df["Clave tokens carrera"] = (
+        eval_df["Nombre tokens match"].fillna("").astype(str)
+        + "||"
+        + eval_df["Carrera match EVALUATEC"].fillna("").astype(str)
+    )
+
     hist = hist.add_prefix("hist_")
     eval_df = eval_df.add_prefix("eval_")
+
     df_cruzado = hist.merge(
-        eval_df, left_on="hist_Clave cruce maestra", right_on="eval_Clave cruce maestra",
-        how="outer", indicator=True
+        eval_df,
+        left_on="hist_Clave cruce maestra",
+        right_on="eval_Clave cruce maestra",
+        how="outer",
+        indicator=True
+    )
+    df_cruzado["Método cruce"] = np.where(
+        df_cruzado["_merge"] == "both",
+        "Nombre y carrera",
+        "Sin coincidencia"
     )
 
-    # Respaldo por nombre únicamente cuando es inequívoco en ambas fuentes.
-    hist_counts = hist["hist_Nombre match"].value_counts()
-    eval_counts = eval_df["eval_Nombre match"].value_counts()
-    eval_unicos = {
-        row["eval_Nombre match"]: row for _, row in eval_df.iterrows()
-        if eval_counts.get(row["eval_Nombre match"], 0) == 1
-    }
+    # Índices de filas EVALUATEC que aún no se han utilizado.
+    eval_right = df_cruzado[df_cruzado["_merge"] == "right_only"].copy()
     usados = set()
+
+    def incorporar_fila_eval(idx_destino, fila_eval, metodo):
+        clave_eval = fila_eval.get("eval_Clave cruce maestra", "")
+        if clave_eval in usados:
+            return False
+        for col in eval_df.columns:
+            df_cruzado.at[idx_destino, col] = fila_eval.get(col, np.nan)
+        df_cruzado.at[idx_destino, "_merge"] = "both"
+        df_cruzado.at[idx_destino, "Método cruce"] = metodo
+        usados.add(clave_eval)
+        return True
+
+    # 2) Tokens del nombre + carrera, solamente cuando la llave es única.
+    eval_tokens_counts = eval_right["eval_Clave tokens carrera"].value_counts()
+    eval_tokens_map = {
+        row["eval_Clave tokens carrera"]: row
+        for _, row in eval_right.iterrows()
+        if row.get("eval_Clave tokens carrera", "")
+        and eval_tokens_counts.get(row["eval_Clave tokens carrera"], 0) == 1
+    }
+    hist_tokens_counts = hist["hist_Clave tokens carrera"].value_counts()
+    for idx in df_cruzado.index[df_cruzado["_merge"] == "left_only"]:
+        clave = df_cruzado.at[idx, "hist_Clave tokens carrera"]
+        if (
+            clave
+            and hist_tokens_counts.get(clave, 0) == 1
+            and clave in eval_tokens_map
+        ):
+            incorporar_fila_eval(
+                idx, eval_tokens_map[clave], "Nombre sin importar orden y carrera"
+            )
+
+    # 3) Nombre normalizado único, aunque la carrera esté escrita diferente.
+    eval_disponible = eval_right[
+        ~eval_right["eval_Clave cruce maestra"].isin(usados)
+    ].copy()
+    hist_counts = hist["hist_Nombre match"].value_counts()
+    eval_counts = eval_disponible["eval_Nombre match"].value_counts()
+    eval_unicos = {
+        row["eval_Nombre match"]: row
+        for _, row in eval_disponible.iterrows()
+        if row.get("eval_Nombre match", "")
+        and eval_counts.get(row["eval_Nombre match"], 0) == 1
+    }
     for idx in df_cruzado.index[df_cruzado["_merge"] == "left_only"]:
         nombre = df_cruzado.at[idx, "hist_Nombre match"]
-        if hist_counts.get(nombre, 0) != 1 or nombre not in eval_unicos:
-            continue
-        row = eval_unicos[nombre]
-        clave = row["eval_Clave cruce maestra"]
-        if clave in usados:
-            continue
-        for col in eval_df.columns:
-            df_cruzado.at[idx, col] = row[col]
-        df_cruzado.at[idx, "_merge"] = "both"
-        usados.add(clave)
-    if usados:
-        df_cruzado = df_cruzado[~((df_cruzado["_merge"] == "right_only") & df_cruzado["eval_Clave cruce maestra"].isin(usados))].copy()
+        if hist_counts.get(nombre, 0) == 1 and nombre in eval_unicos:
+            incorporar_fila_eval(idx, eval_unicos[nombre], "Nombre único")
 
-    df_cruzado["Nombre"] = df_cruzado["hist_Nombre completo Historial"].combine_first(df_cruzado["eval_Nombre completo EVALUATEC"])
+    # 4) Tokens del nombre únicos como último respaldo.
+    eval_disponible = eval_right[
+        ~eval_right["eval_Clave cruce maestra"].isin(usados)
+    ].copy()
+    hist_token_name_counts = hist["hist_Nombre tokens match"].value_counts()
+    eval_token_name_counts = eval_disponible["eval_Nombre tokens match"].value_counts()
+    eval_token_unicos = {
+        row["eval_Nombre tokens match"]: row
+        for _, row in eval_disponible.iterrows()
+        if row.get("eval_Nombre tokens match", "")
+        and eval_token_name_counts.get(row["eval_Nombre tokens match"], 0) == 1
+    }
+    for idx in df_cruzado.index[df_cruzado["_merge"] == "left_only"]:
+        clave = df_cruzado.at[idx, "hist_Nombre tokens match"]
+        if hist_token_name_counts.get(clave, 0) == 1 and clave in eval_token_unicos:
+            incorporar_fila_eval(
+                idx, eval_token_unicos[clave], "Nombre único sin importar orden"
+            )
+
+    if usados:
+        df_cruzado = df_cruzado[
+            ~(
+                (df_cruzado["_merge"] == "right_only")
+                & df_cruzado["eval_Clave cruce maestra"].isin(usados)
+            )
+        ].copy()
+
+    df_cruzado["Nombre"] = df_cruzado[
+        "hist_Nombre completo Historial"
+    ].combine_first(df_cruzado["eval_Nombre completo EVALUATEC"])
     df_cruzado["Carrera Historial"] = df_cruzado["hist_Carrera historial"]
     df_cruzado["Carrera EVALUATEC"] = df_cruzado["eval_Carrera EVALUATEC"]
-    df_cruzado["Carrera"] = df_cruzado["Carrera Historial"].combine_first(df_cruzado["Carrera EVALUATEC"])
-    df_cruzado["Carrera match"] = df_cruzado["hist_Carrera match Historial"].combine_first(df_cruzado["eval_Carrera match EVALUATEC"])
+    df_cruzado["Carrera"] = df_cruzado["Carrera Historial"].combine_first(
+        df_cruzado["Carrera EVALUATEC"]
+    )
+    df_cruzado["Carrera match"] = df_cruzado[
+        "hist_Carrera match Historial"
+    ].combine_first(df_cruzado["eval_Carrera match EVALUATEC"])
+
     df_cruzado["Estatus cruce"] = np.select(
-        [df_cruzado["_merge"] == "both", df_cruzado["_merge"] == "left_only", df_cruzado["_merge"] == "right_only"],
-        ["Coincide en Historial y EVALUATEC", "Solo en Historial", "Solo en EVALUATEC"],
+        [
+            df_cruzado["_merge"] == "both",
+            df_cruzado["_merge"] == "left_only",
+            df_cruzado["_merge"] == "right_only"
+        ],
+        [
+            "Coincide en Historial y EVALUATEC",
+            "Solo en Historial",
+            "Solo en EVALUATEC"
+        ],
         default="Sin clasificar"
     )
-    df_cruzado["Carrera coincide Historial/EVALUATEC"] = df_cruzado["hist_Carrera match Historial"] == df_cruzado["eval_Carrera match EVALUATEC"]
-    df_cruzado.loc[(df_cruzado["_merge"] == "both") & (~df_cruzado["Carrera coincide Historial/EVALUATEC"].fillna(False)), "Estatus cruce"] = "Coincide por nombre, carrera distinta"
+    df_cruzado["Carrera coincide Historial/EVALUATEC"] = (
+        df_cruzado["hist_Carrera match Historial"]
+        == df_cruzado["eval_Carrera match EVALUATEC"]
+    )
+    mascara_carrera_distinta = (
+        (df_cruzado["_merge"] == "both")
+        & (~df_cruzado["Carrera coincide Historial/EVALUATEC"].fillna(False))
+    )
+    df_cruzado.loc[mascara_carrera_distinta, "Estatus cruce"] = (
+        "Coincide por nombre, carrera distinta"
+    )
     return df_cruzado.reset_index(drop=True)
 
 
@@ -2304,6 +2448,9 @@ def buscar_chaside_para_estudiante(fila, df_chaside):
     if "Nombre match" not in base.columns:
         col = util_encontrar_columna(base, ["Nombre completo CHASIDE", CHASIDE_COLUMNA_NOMBRE, "Nombre completo"])
         base["Nombre match"] = base[col].apply(normalizar_nombre) if col is not None else ""
+    base["Nombre tokens match"] = base["Nombre match"].apply(
+        crear_clave_nombre_por_tokens
+    )
     if "Carrera match CHASIDE" not in base.columns:
         col = util_encontrar_columna(base, ["Carrera elegida CHASIDE", CHASIDE_COLUMNA_CARRERA, "Carrera"])
         base["Carrera match CHASIDE"] = base[col].apply(simplificar_carrera) if col is not None else ""
@@ -2322,6 +2469,20 @@ def buscar_chaside_para_estudiante(fila, df_chaside):
             match = por_nombre_carrera; estatus = "Coincide por nombre y carrera"
         elif len(por_nombre) == 1:
             match = por_nombre; estatus = "Coincide por nombre único"
+
+    if match.empty and nombre:
+        clave_tokens = crear_clave_nombre_por_tokens(nombre)
+        por_tokens = base[base["Nombre tokens match"] == clave_tokens].copy()
+        por_tokens_carrera = (
+            por_tokens[por_tokens["Carrera match CHASIDE"] == carrera].copy()
+            if carrera else pd.DataFrame()
+        )
+        if len(por_tokens_carrera) == 1:
+            match = por_tokens_carrera
+            estatus = "Coincide por nombre sin importar orden y carrera"
+        elif len(por_tokens) == 1:
+            match = por_tokens
+            estatus = "Coincide por nombre único sin importar orden"
     if match.empty:
         return resultado_base
     mejor = match.iloc[-1]
@@ -2441,6 +2602,7 @@ def generar_concentrado_maestro(
             "Carrera Historial": valor_seguro(fila, "Carrera Historial"),
             "Carrera EVALUATEC": valor_seguro(fila, "Carrera EVALUATEC"),
             "Estatus cruce": valor_seguro(fila, "Estatus cruce"),
+            "Método cruce": valor_seguro(fila, "Método cruce"),
             "Sexo": valor_seguro(fila, "hist_Sexo"),
             "Escuela de procedencia": valor_seguro(
                 fila,
