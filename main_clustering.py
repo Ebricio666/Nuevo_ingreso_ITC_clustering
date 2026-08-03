@@ -623,23 +623,102 @@ def hist_convertir_calificacion_propedeutico(valor):
 
 
 def hist_detectar_columnas_propedeutico(df):
-    """Detecta las columnas de Ciencias Básicas y del departamento académico."""
-    columnas_calificacion = [
-        columna for columna in df.columns
-        if "cal final" in util_limpiar_texto(columna)
-    ]
+    """
+    Detecta las columnas de Ciencias Básicas y evaluación departamental.
+
+    Tolera variaciones de encabezados producidas por Excel/Google Sheets:
+    - Cbásicas / Ciencias Básicas / C. Básicas
+    - Cal final / calificación final / escala 0 a 100
+    - nombres específicos de la carrera
+
+    Como respaldo, usa las columnas K y L cuando conservan la estructura
+    original del Historial.
+    """
+    columnas = list(df.columns)
+
+    def texto_columna(columna):
+        texto = util_limpiar_texto(columna)
+        texto = re.sub(r"[^a-z0-9\s]", " ", texto)
+        return re.sub(r"\s+", " ", texto).strip()
+
+    def parece_calificacion(texto):
+        expresiones = [
+            "cal final",
+            "calificacion final",
+            "calificacion",
+            "0 al 100",
+            "0 a 100",
+            "escala 0 100"
+        ]
+        return any(expresion in texto for expresion in expresiones)
 
     columna_basicas = None
     columna_departamento = None
 
-    for columna in columnas_calificacion:
-        texto = util_limpiar_texto(columna)
-        if "basica" in texto or "basicas" in texto:
+    # Primera pasada: detección semántica.
+    candidatas = []
+    for columna in columnas:
+        texto = texto_columna(columna)
+
+        if parece_calificacion(texto):
+            candidatas.append(columna)
+
+        if (
+            "cbasicas" in texto.replace(" ", "")
+            or "c basicas" in texto
+            or "ciencias basicas" in texto
+            or "ciencia basica" in texto
+        ):
             columna_basicas = columna
-        elif columna_departamento is None:
+
+    # Si no apareció el texto "cal final", conservar columnas que mencionen
+    # explícitamente Ciencias Básicas o una escala 0-100.
+    if columna_basicas is None:
+        for columna in columnas:
+            texto = texto_columna(columna)
+            compacto = texto.replace(" ", "")
+            if (
+                "cbasicas" in compacto
+                or "cienciasbasicas" in compacto
+                or (
+                    "basicas" in texto
+                    and ("100" in texto or "cal" in texto)
+                )
+            ):
+                columna_basicas = columna
+                break
+
+    # La evaluación departamental es la otra columna de calificación.
+    for columna in candidatas:
+        if columna != columna_basicas:
             columna_departamento = columna
+            break
+
+    # Respaldo estructural: en el archivo institucional las calificaciones
+    # están en K y L, índices 10 y 11.
+    if columna_basicas is None and len(columnas) > 10:
+        candidata_k = columnas[10]
+        texto_k = texto_columna(candidata_k)
+        if (
+            "basica" in texto_k
+            or "cbasica" in texto_k.replace(" ", "")
+            or "100" in texto_k
+        ):
+            columna_basicas = candidata_k
+
+    if columna_departamento is None and len(columnas) > 11:
+        candidata_l = columnas[11]
+        if candidata_l != columna_basicas:
+            texto_l = texto_columna(candidata_l)
+            if (
+                "100" in texto_l
+                or "cal" in texto_l
+                or "final" in texto_l
+            ):
+                columna_departamento = candidata_l
 
     return columna_basicas, columna_departamento
+
 
 
 def hist_convertir_promedio(valor):
@@ -1371,7 +1450,6 @@ def hist_procesar_hoja(contenido_archivo, nombre_hoja):
     }
 
 
-@st.cache_data(show_spinner=False)
 def hist_procesar_archivo_excel(contenido_archivo):
     """
     Procesa todo el Excel de Historial de Aspirantes.
@@ -3830,6 +3908,63 @@ def render_app_maestra():
                         "El Concentrado maestro quedó vacío."
                     )
                     st.stop()
+
+                # Validación obligatoria del propedéutico.
+                columnas_propedeutico = [
+                    "Propedéutico Ciencias Básicas",
+                    "Propedéutico Departamento",
+                    "Promedio Propedéutico"
+                ]
+
+                faltantes_propedeutico = [
+                    columna
+                    for columna in columnas_propedeutico
+                    if columna not in df_maestro.columns
+                ]
+
+                if faltantes_propedeutico:
+                    raise ValueError(
+                        "El Concentrado maestro no contiene las columnas "
+                        "propedéuticas requeridas: "
+                        + ", ".join(faltantes_propedeutico)
+                    )
+
+                conteo_basicas = pd.to_numeric(
+                    df_maestro["Propedéutico Ciencias Básicas"],
+                    errors="coerce"
+                ).notna().sum()
+
+                conteo_departamento = pd.to_numeric(
+                    df_maestro["Propedéutico Departamento"],
+                    errors="coerce"
+                ).notna().sum()
+
+                if conteo_basicas == 0 or conteo_departamento == 0:
+                    columnas_historial = [
+                        str(columna)
+                        for columna in df_historial_raw.columns
+                        if (
+                            "basica" in util_limpiar_texto(columna)
+                            or "cal final" in util_limpiar_texto(columna)
+                            or "0 al 100" in util_limpiar_texto(columna)
+                            or "0 a 100" in util_limpiar_texto(columna)
+                        )
+                    ]
+
+                    raise ValueError(
+                        "Se detuvo la generación porque las calificaciones "
+                        "propedéuticas quedaron vacías. "
+                        f"Ciencias Básicas recuperadas: {conteo_basicas}; "
+                        f"departamentales recuperadas: {conteo_departamento}. "
+                        "Encabezados académicos detectados en Historial: "
+                        + (
+                            ", ".join(columnas_historial[:20])
+                            if columnas_historial
+                            else "ninguno"
+                        )
+                        + ". Carga manualmente el Excel corregido para verificar "
+                        "si el enlace de Historial apunta a una versión anterior."
+                    )
 
                 # Se conserva la segmentación en los datos de salida,
                 # aunque ya no se muestra dentro de Streamlit.
