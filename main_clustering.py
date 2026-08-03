@@ -2550,6 +2550,185 @@ def obtener_dos_areas_evaluatec(fila, tipo="fuerte"):
     
 
 
+
+def completar_propedeutico_desde_historial(df_maestro, df_historial_preparado):
+    """Completa de forma explícita los resultados propedéuticos.
+
+    Esta segunda capa de vinculación evita que las calificaciones se pierdan
+    aunque el cruce Historial–EVALUATEC haya recuperado otros datos académicos.
+
+    Prioridad:
+    1. Matrícula/ID única.
+    2. Nombre normalizado + carrera.
+    3. Palabras del nombre (sin importar orden) + carrera.
+    4. Nombre único.
+    """
+    if df_maestro is None or df_maestro.empty:
+        return df_maestro
+    if df_historial_preparado is None or df_historial_preparado.empty:
+        return df_maestro
+
+    maestro = df_maestro.copy()
+    hist = df_historial_preparado.copy()
+
+    columnas_prop = [
+        "Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento",
+        "Promedio Propedéutico",
+        "Nombre evaluación departamental"
+    ]
+    defaults = {
+        "Propedéutico Ciencias Básicas": np.nan,
+        "Propedéutico Departamento": np.nan,
+        "Promedio Propedéutico": np.nan,
+        "Nombre evaluación departamental": "Sin dato"
+    }
+    for col, default in defaults.items():
+        if col not in maestro.columns:
+            maestro[col] = default
+        if col not in hist.columns:
+            hist[col] = default
+
+    def id_limpio(valor):
+        if pd.isna(valor):
+            return ""
+        texto = str(valor).strip()
+        if texto.lower() in {"", "nan", "none", "sin dato"}:
+            return ""
+        try:
+            numero = float(texto)
+            if numero.is_integer():
+                return str(int(numero))
+        except (TypeError, ValueError):
+            pass
+        return texto
+
+    if "Nombre match" not in hist.columns:
+        col_nombre_hist = util_encontrar_columna(
+            hist,
+            ["Nombre completo Historial", "Nombre completo historial", "Nombre visible", "Nombre"]
+        )
+        hist["Nombre match"] = (
+            hist[col_nombre_hist].apply(normalizar_nombre)
+            if col_nombre_hist is not None else ""
+        )
+    if "Nombre tokens match" not in hist.columns:
+        hist["Nombre tokens match"] = hist["Nombre match"].apply(
+            crear_clave_nombre_por_tokens
+        )
+    if "Carrera match Historial" not in hist.columns:
+        col_carrera_hist = util_encontrar_columna(
+            hist, ["Carrera historial", "Carrera", "Programa"]
+        )
+        hist["Carrera match Historial"] = (
+            hist[col_carrera_hist].apply(simplificar_carrera)
+            if col_carrera_hist is not None else ""
+        )
+
+    maestro["__id_prop"] = maestro.get("Matrícula/ID", "").apply(id_limpio)
+    hist["__id_prop"] = hist.get("Matrícula/ID", "").apply(id_limpio)
+    maestro["__nombre_prop"] = maestro.get("Nombre", "").apply(normalizar_nombre)
+    maestro["__tokens_prop"] = maestro.get("Nombre", "").apply(
+        crear_clave_nombre_por_tokens
+    )
+    maestro["__carrera_prop"] = maestro.get("Carrera", "").apply(simplificar_carrera)
+
+    hist["__clave_nombre_carrera"] = (
+        hist["Nombre match"].fillna("").astype(str)
+        + "||" + hist["Carrera match Historial"].fillna("").astype(str)
+    )
+    hist["__clave_tokens_carrera"] = (
+        hist["Nombre tokens match"].fillna("").astype(str)
+        + "||" + hist["Carrera match Historial"].fillna("").astype(str)
+    )
+    maestro["__clave_nombre_carrera"] = (
+        maestro["__nombre_prop"].fillna("").astype(str)
+        + "||" + maestro["__carrera_prop"].fillna("").astype(str)
+    )
+    maestro["__clave_tokens_carrera"] = (
+        maestro["__tokens_prop"].fillna("").astype(str)
+        + "||" + maestro["__carrera_prop"].fillna("").astype(str)
+    )
+
+    def tabla_unica(columna_clave):
+        base = hist[hist[columna_clave].fillna("").astype(str).str.strip() != ""].copy()
+        conteos = base[columna_clave].value_counts(dropna=False)
+        claves = conteos[conteos == 1].index
+        return base[base[columna_clave].isin(claves)].set_index(columna_clave)
+
+    lookups = [
+        ("__id_prop", tabla_unica("__id_prop"), "Matrícula/ID"),
+        ("__clave_nombre_carrera", tabla_unica("__clave_nombre_carrera"), "Nombre y carrera"),
+        ("__clave_tokens_carrera", tabla_unica("__clave_tokens_carrera"), "Nombre sin importar orden y carrera"),
+        ("__nombre_prop", None, "Nombre único")
+    ]
+
+    # El último respaldo usa nombre único en Historial.
+    hist_nombre = hist.copy()
+    hist_nombre["__nombre_prop"] = hist_nombre["Nombre match"].fillna("").astype(str)
+    lookups[-1] = ("__nombre_prop", tabla_unica("Nombre match"), "Nombre único")
+
+    maestro["Método cruce propedéutico"] = "No encontrado"
+
+    def falta_valor(valor):
+        return pd.isna(valor) or str(valor).strip().lower() in {"", "nan", "none", "sin dato"}
+
+    for idx in maestro.index:
+        # No sobreescribir datos válidos ya recuperados.
+        necesita = any(falta_valor(maestro.at[idx, col]) for col in columnas_prop[:3])
+        if not necesita:
+            maestro.at[idx, "Método cruce propedéutico"] = "Recuperado en cruce principal"
+            continue
+
+        fila_hist = None
+        metodo = "No encontrado"
+        for clave_maestro, lookup, etiqueta in lookups:
+            clave = maestro.at[idx, clave_maestro]
+            if falta_valor(clave) or lookup is None:
+                continue
+            if clave in lookup.index:
+                candidato = lookup.loc[clave]
+                if isinstance(candidato, pd.DataFrame):
+                    continue
+                fila_hist = candidato
+                metodo = etiqueta
+                break
+
+        if fila_hist is None:
+            continue
+
+        for col in columnas_prop:
+            valor_hist = fila_hist.get(col, np.nan)
+            if falta_valor(maestro.at[idx, col]) and not falta_valor(valor_hist):
+                maestro.at[idx, col] = valor_hist
+        maestro.at[idx, "Método cruce propedéutico"] = metodo
+
+    # Forzar escala numérica y recalcular el promedio cuando sea posible.
+    for col in ["Propedéutico Ciencias Básicas", "Propedéutico Departamento"]:
+        maestro[col] = pd.to_numeric(maestro[col], errors="coerce")
+        maestro.loc[~maestro[col].between(0, 100, inclusive="both"), col] = np.nan
+
+    promedio_calculado = maestro[
+        ["Propedéutico Ciencias Básicas", "Propedéutico Departamento"]
+    ].mean(axis=1, skipna=True)
+    maestro["Promedio Propedéutico"] = pd.to_numeric(
+        maestro["Promedio Propedéutico"], errors="coerce"
+    ).combine_first(promedio_calculado)
+
+    # Si existe únicamente una calificación, utilizarla como promedio.
+    maestro["Promedio Propedéutico"] = maestro["Promedio Propedéutico"].where(
+        maestro["Promedio Propedéutico"].between(0, 100, inclusive="both"),
+        promedio_calculado
+    )
+
+    columnas_aux = [
+        "__id_prop", "__nombre_prop", "__tokens_prop", "__carrera_prop",
+        "__clave_nombre_carrera", "__clave_tokens_carrera"
+    ]
+    maestro = maestro.drop(columns=[c for c in columnas_aux if c in maestro.columns])
+    return maestro
+
+
 def generar_concentrado_maestro(
     df_historial_preparado,
     df_evaluatec_preparado,
@@ -2677,6 +2856,12 @@ def generar_concentrado_maestro(
 
     if df_maestro.empty:
         return df_maestro
+
+    # Respaldo explícito: completa las calificaciones directamente desde Historial.
+    df_maestro = completar_propedeutico_desde_historial(
+        df_maestro=df_maestro,
+        df_historial_preparado=df_historial_preparado
+    )
 
     df_maestro = df_maestro.sort_values(
         [
