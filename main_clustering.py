@@ -871,11 +871,20 @@ def integrar_sitec_en_maestro(df_maestro, df_sitec_preparado):
         if columna not in columnas_helper_sitec
     ]
 
-    # Crear columnas destino desde el inicio.
+    # Crear columnas destino desde el inicio como tipo object.
+    # SIITEC contiene una mezcla de texto, números, fechas, CURP, etc.
+    # En Pandas 3.x una columna inicializada solo con np.nan se vuelve float64
+    # y después rechaza valores de texto. Por eso se fuerza dtype=object.
     for columna in columnas_originales_sitec:
         destino = f"SIITEC · {columna}"
         if destino not in maestro.columns:
-            maestro[destino] = np.nan
+            maestro[destino] = pd.Series(
+                [None] * len(maestro),
+                index=maestro.index,
+                dtype="object"
+            )
+        else:
+            maestro[destino] = maestro[destino].astype("object")
 
     maestro["Estatus cruce SIITEC"] = "No encontrado"
     maestro["Método cruce SIITEC"] = "No encontrado"
@@ -936,10 +945,16 @@ def integrar_sitec_en_maestro(df_maestro, df_sitec_preparado):
             return False
 
         for columna in columnas_originales_sitec:
+            destino = f"SIITEC · {columna}"
+
+            # Refuerzo para compatibilidad con Pandas 3.x.
+            if maestro[destino].dtype != "object":
+                maestro[destino] = maestro[destino].astype("object")
+
             maestro.at[
                 idx_master,
-                f"SIITEC · {columna}"
-            ] = fila_sitec.get(columna, np.nan)
+                destino
+            ] = fila_sitec.get(columna, None)
 
         maestro.at[
             idx_master,
