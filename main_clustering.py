@@ -699,6 +699,8 @@ def sitec_preparar_para_cruce(df_sitec):
         [
             "apellido paterno",
             "apellido_paterno",
+            "apellido1",
+            "apellido 1",
             "primer apellido",
             "paterno"
         ]
@@ -709,6 +711,8 @@ def sitec_preparar_para_cruce(df_sitec):
         [
             "apellido materno",
             "apellido_materno",
+            "apellido2",
+            "apellido 2",
             "segundo apellido",
             "materno"
         ]
