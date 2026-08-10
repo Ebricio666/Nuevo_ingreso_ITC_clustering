@@ -560,20 +560,63 @@ def diagnosticar_archivo_historial(contenido_archivo):
 # SIITEC
 # ============================================================
 
+def transformar_link_sitec_descarga(url):
+    """
+    Convierte un enlace SIITEC a una URL de descarga válida.
+
+    Soporta:
+    - Google Sheets -> export XLSX
+    - Google Drive /file/d/... -> descarga directa
+    - URL directa -> se conserva
+    - Carpetas de Drive -> no son archivos y se rechazan explícitamente
+    """
+    url = str(url).strip()
+
+    if url == "":
+        return ""
+
+    if "drive.google.com/drive/folders/" in url:
+        raise ValueError(
+            "El enlace SIITEC corresponde a una carpeta de Google Drive, no a un archivo. "
+            "Pega el enlace del archivo Excel/Google Sheets específico o utiliza la carga manual."
+        )
+
+    if "docs.google.com/spreadsheets" in url:
+        return transformar_link_google_sheets_xlsx(url)
+
+    if "drive.google.com/file/d/" in url or (
+        "drive.google.com" in url and "id=" in url
+    ):
+        return transformar_link_drive_descarga(url)
+
+    return url
+
+
 def obtener_contenido_sitec_desde_link_o_upload(url_sitec, archivo_sitec):
     """
     Obtiene la base SIITEC.
 
     Prioridad:
     1. Archivo cargado manualmente.
-    2. Link público de Google Sheets/Excel.
+    2. Link público de Google Sheets.
+    3. Link público de archivo de Google Drive.
+    4. URL directa.
+
+    La carga manual tiene prioridad para facilitar auditorías.
     """
     if archivo_sitec is not None:
         return archivo_sitec.getvalue()
 
     if str(url_sitec).strip() != "":
-        url_descarga = transformar_link_google_sheets_xlsx(url_sitec)
-        return descargar_archivo_url(url_descarga)
+        url_descarga = transformar_link_sitec_descarga(url_sitec)
+        contenido = descargar_archivo_url(url_descarga)
+
+        if contenido is None or len(contenido) == 0:
+            raise ValueError(
+                "SIITEC devolvió un archivo vacío."
+            )
+
+        return contenido
 
     return None
 
@@ -606,23 +649,70 @@ def sitec_encontrar_columna_exacta(df, candidatos):
 
 def sitec_leer_excel(contenido_archivo):
     """
-    Lee SIITEC desde Excel.
+    Lee SIITEC desde XLSX/XLS y valida que el contenido realmente sea un archivo.
 
-    Si existen varias hojas con registros, las concatena y conserva
-    la hoja de procedencia en 'SIITEC hoja origen'.
+    Evita el error:
+        Excel file format cannot be determined
+
+    cuando Google Drive devuelve una página HTML de vista previa,
+    inicio de sesión o permisos en lugar del archivo.
     """
     if contenido_archivo is None:
         return pd.DataFrame()
 
-    excel = pd.ExcelFile(io.BytesIO(contenido_archivo))
+    contenido = bytes(contenido_archivo)
+
+    if len(contenido) < 8:
+        raise ValueError(
+            "El archivo SIITEC está vacío o incompleto."
+        )
+
+    inicio = contenido[:200].lstrip().lower()
+
+    # Google Drive puede devolver HTML aunque el status HTTP sea 200.
+    if (
+        inicio.startswith(b"<!doctype html")
+        or inicio.startswith(b"<html")
+        or b"<html" in inicio
+    ):
+        raise ValueError(
+            "El enlace SIITEC devolvió una página HTML en lugar del Excel. "
+            "Verifica que el archivo esté compartido como 'Cualquier persona con el enlace: Lector', "
+            "usa el enlace directo del archivo (no una carpeta) o utiliza la carga manual."
+        )
+
+    buffer = io.BytesIO(contenido)
+
+    # XLSX/ZIP inicia con PK. XLS binario inicia con D0 CF 11 E0.
+    if contenido[:2] == b"PK":
+        engine = "openpyxl"
+    elif contenido[:4] == bytes.fromhex("D0CF11E0"):
+        engine = "xlrd"
+    else:
+        # Último intento: dejar que pandas identifique el formato.
+        engine = None
+
+    try:
+        excel = pd.ExcelFile(
+            buffer,
+            engine=engine
+        )
+    except Exception as error:
+        raise ValueError(
+            "El contenido descargado para SIITEC no pudo reconocerse como Excel. "
+            "Pega un enlace directo al archivo .xlsx/.xls o utiliza carga manual. "
+            f"Detalle técnico: {error}"
+        )
+
     bases = []
 
     for hoja in excel.sheet_names:
         try:
             df = pd.read_excel(
-                io.BytesIO(contenido_archivo),
+                io.BytesIO(contenido),
                 sheet_name=hoja,
-                dtype=object
+                dtype=object,
+                engine=engine
             )
         except Exception:
             continue
@@ -630,7 +720,6 @@ def sitec_leer_excel(contenido_archivo):
         if df is None or df.empty:
             continue
 
-        # Eliminar columnas completamente vacías.
         df = df.dropna(axis=1, how="all").dropna(how="all").copy()
 
         if df.empty:
@@ -640,7 +729,9 @@ def sitec_leer_excel(contenido_archivo):
         bases.append(df)
 
     if not bases:
-        return pd.DataFrame()
+        raise ValueError(
+            "El archivo SIITEC se abrió, pero no se encontraron hojas con registros."
+        )
 
     return pd.concat(
         bases,
@@ -699,10 +790,10 @@ def sitec_preparar_para_cruce(df_sitec):
         [
             "apellido paterno",
             "apellido_paterno",
-            "apellido1",
-            "apellido 1",
             "primer apellido",
-            "paterno"
+            "paterno",
+            "apellido1",
+            "apellido 1"
         ]
     )
 
@@ -711,10 +802,10 @@ def sitec_preparar_para_cruce(df_sitec):
         [
             "apellido materno",
             "apellido_materno",
-            "apellido2",
-            "apellido 2",
             "segundo apellido",
-            "materno"
+            "materno",
+            "apellido2",
+            "apellido 2"
         ]
     )
 
@@ -5234,8 +5325,9 @@ def render_app_maestra():
         value=LINK_SIITEC_DEFAULT,
         key="url_sitec_maestro",
         help=(
-            "Pega el enlace público de SIITEC. "
-            "Si cargas un archivo manualmente, la carga manual tendrá prioridad."
+            "Pega el enlace del ARCHIVO SIITEC (Google Sheets o archivo Excel de Drive), "
+            "no el enlace de una carpeta. Si cargas un archivo manualmente, "
+            "la carga manual tendrá prioridad."
         )
     )
 
