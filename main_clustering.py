@@ -119,6 +119,10 @@ LINK_HISTORIAL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ad3Xi42BOU10TT
 
 LINK_CHASIDE_DEFAULT = "https://docs.google.com/spreadsheets/d/1YHMEb5hftOZfV-CMWoUsUgJh1xmsgTY3YYwAtq1dGQA/edit?resourcekey=&gid=1491376423#gid=1491376423"
 
+# SIITEC: dejar vacío hasta pegar el enlace institucional.
+# También puede cargarse manualmente desde la interfaz.
+LINK_SIITEC_DEFAULT = ""
+
 LINK_EVALUATEC_ADM_DEFAULT = "https://drive.google.com/file/d/1OLECyh4lb578nJw_w00os-TdKEh7kLLN/view?usp=sharing"
 LINK_EVALUATEC_ARQ_DEFAULT = "https://drive.google.com/file/d/1jE_YYsT0kk56EiGP3EwAa1w29Yd8wX2G/view?usp=share_link"
 LINK_EVALUATEC_ING_DEFAULT = "https://drive.google.com/file/d/1iBUu338DgspUkSXhtuIaDs6h8F4cbIxX/view?usp=sharing"
@@ -549,6 +553,520 @@ def diagnosticar_archivo_historial(contenido_archivo):
         })
 
     return excel.sheet_names, pd.DataFrame(resumen)
+
+
+
+# ============================================================
+# SIITEC
+# ============================================================
+
+def obtener_contenido_sitec_desde_link_o_upload(url_sitec, archivo_sitec):
+    """
+    Obtiene la base SIITEC.
+
+    Prioridad:
+    1. Archivo cargado manualmente.
+    2. Link público de Google Sheets/Excel.
+    """
+    if archivo_sitec is not None:
+        return archivo_sitec.getvalue()
+
+    if str(url_sitec).strip() != "":
+        url_descarga = transformar_link_google_sheets_xlsx(url_sitec)
+        return descargar_archivo_url(url_descarga)
+
+    return None
+
+
+def sitec_encontrar_columna_exacta(df, candidatos):
+    """
+    Busca columnas SIITEC por equivalencia normalizada exacta.
+    Evita confundir, por ejemplo, 'nombre' con 'nombre_madre'.
+    """
+    mapa = {
+        util_limpiar_texto(columna)
+        .replace("_", " ")
+        .replace("-", " ")
+        .strip(): columna
+        for columna in df.columns
+    }
+
+    for candidato in candidatos:
+        clave = (
+            util_limpiar_texto(candidato)
+            .replace("_", " ")
+            .replace("-", " ")
+            .strip()
+        )
+        if clave in mapa:
+            return mapa[clave]
+
+    return None
+
+
+def sitec_leer_excel(contenido_archivo):
+    """
+    Lee SIITEC desde Excel.
+
+    Si existen varias hojas con registros, las concatena y conserva
+    la hoja de procedencia en 'SIITEC hoja origen'.
+    """
+    if contenido_archivo is None:
+        return pd.DataFrame()
+
+    excel = pd.ExcelFile(io.BytesIO(contenido_archivo))
+    bases = []
+
+    for hoja in excel.sheet_names:
+        try:
+            df = pd.read_excel(
+                io.BytesIO(contenido_archivo),
+                sheet_name=hoja,
+                dtype=object
+            )
+        except Exception:
+            continue
+
+        if df is None or df.empty:
+            continue
+
+        # Eliminar columnas completamente vacías.
+        df = df.dropna(axis=1, how="all").dropna(how="all").copy()
+
+        if df.empty:
+            continue
+
+        df["SIITEC hoja origen"] = str(hoja)
+        bases.append(df)
+
+    if not bases:
+        return pd.DataFrame()
+
+    return pd.concat(
+        bases,
+        ignore_index=True,
+        sort=False
+    )
+
+
+def sitec_preparar_para_cruce(df_sitec):
+    """
+    Prepara SIITEC para cruce nominal conservando TODAS sus columnas.
+
+    El cruce se apoya en:
+    - nombre normalizado;
+    - palabras del nombre sin importar orden;
+    - carrera normalizada cuando esté disponible.
+
+    No elimina ninguna variable original de SIITEC.
+    """
+    if df_sitec is None or df_sitec.empty:
+        return pd.DataFrame()
+
+    df = df_sitec.copy()
+    df.columns = [
+        util_limpiar_texto_visible(columna)
+        if str(columna).strip() != ""
+        else f"Columna SIITEC {i + 1}"
+        for i, columna in enumerate(df.columns)
+    ]
+
+    # --------------------------------------------------------
+    # Detectar nombre completo o construirlo desde componentes.
+    # --------------------------------------------------------
+    col_nombre_completo = sitec_encontrar_columna_exacta(
+        df,
+        [
+            "nombre completo",
+            "nombre_completo",
+            "nombre del aspirante",
+            "aspirante"
+        ]
+    )
+
+    col_nombre = sitec_encontrar_columna_exacta(
+        df,
+        [
+            "nombre",
+            "nombres",
+            "nombre(s)",
+            "nombre (s)"
+        ]
+    )
+
+    col_paterno = sitec_encontrar_columna_exacta(
+        df,
+        [
+            "apellido paterno",
+            "apellido_paterno",
+            "primer apellido",
+            "paterno"
+        ]
+    )
+
+    col_materno = sitec_encontrar_columna_exacta(
+        df,
+        [
+            "apellido materno",
+            "apellido_materno",
+            "segundo apellido",
+            "materno"
+        ]
+    )
+
+    if col_nombre_completo is not None:
+        nombre_serie = df[col_nombre_completo].fillna("").astype(str)
+
+    elif col_nombre is not None:
+        partes = []
+
+        # SIITEC suele almacenar Nombre + Apellido paterno + Apellido materno.
+        # Para el match el orden no es crítico porque también generamos clave por tokens.
+        partes.append(df[col_nombre].fillna("").astype(str))
+
+        if col_paterno is not None:
+            partes.append(df[col_paterno].fillna("").astype(str))
+
+        if col_materno is not None:
+            partes.append(df[col_materno].fillna("").astype(str))
+
+        nombre_serie = partes[0]
+
+        for parte in partes[1:]:
+            nombre_serie = nombre_serie + " " + parte
+
+    else:
+        raise ValueError(
+            "SIITEC se cargó, pero no se identificó una columna de nombre. "
+            "Columnas detectadas: "
+            + ", ".join(map(str, df.columns[:50]))
+        )
+
+    df["__SIITEC Nombre completo cruce"] = nombre_serie.apply(
+        util_limpiar_texto_visible
+    )
+    df["__SIITEC Nombre match"] = df[
+        "__SIITEC Nombre completo cruce"
+    ].apply(normalizar_nombre)
+    df["__SIITEC Nombre tokens match"] = df[
+        "__SIITEC Nombre completo cruce"
+    ].apply(crear_clave_nombre_por_tokens)
+
+    # --------------------------------------------------------
+    # Carrera
+    # --------------------------------------------------------
+    col_carrera = sitec_encontrar_columna_exacta(
+        df,
+        [
+            "carrera",
+            "carrera elegida",
+            "programa",
+            "programa educativo",
+            "especialidad"
+        ]
+    )
+
+    if col_carrera is not None:
+        df["__SIITEC Carrera visible"] = (
+            df[col_carrera]
+            .fillna("")
+            .astype(str)
+            .apply(util_limpiar_texto_visible)
+        )
+        df["__SIITEC Carrera match"] = df[
+            "__SIITEC Carrera visible"
+        ].apply(simplificar_carrera)
+    else:
+        df["__SIITEC Carrera visible"] = ""
+        df["__SIITEC Carrera match"] = ""
+
+    # Eliminar filas sin identidad nominal.
+    df = df[
+        df["__SIITEC Nombre match"].fillna("").astype(str).str.strip() != ""
+    ].copy()
+
+    return df.reset_index(drop=True)
+
+
+def integrar_sitec_en_maestro(df_maestro, df_sitec_preparado):
+    """
+    Añade TODAS las variables SIITEC al Concentrado maestro.
+
+    Método de vinculación, de más estricto a más flexible:
+    1. Nombre exacto normalizado + carrera.
+    2. Nombre por tokens (orden indiferente) + carrera.
+    3. Nombre exacto, solo si es único en ambas bases.
+    4. Nombre por tokens, solo si es único en ambas bases.
+
+    No se usa fuzzy matching para evitar asignar datos sensibles
+    a la persona equivocada.
+
+    Todas las variables originales se incorporan con prefijo:
+        SIITEC · <nombre original>
+    """
+    if df_maestro is None or df_maestro.empty:
+        return df_maestro, pd.DataFrame(), pd.DataFrame()
+
+    maestro = df_maestro.copy()
+
+    if df_sitec_preparado is None or df_sitec_preparado.empty:
+        maestro["Estatus cruce SIITEC"] = "SIITEC no cargado"
+        maestro["Método cruce SIITEC"] = "No disponible"
+        return maestro, pd.DataFrame(), pd.DataFrame()
+
+    sitec = df_sitec_preparado.copy()
+
+    # Helpers del Master.
+    maestro["__MASTER Nombre match SIITEC"] = maestro[
+        "Nombre"
+    ].apply(normalizar_nombre)
+
+    maestro["__MASTER Nombre tokens SIITEC"] = maestro[
+        "Nombre"
+    ].apply(crear_clave_nombre_por_tokens)
+
+    maestro["__MASTER Carrera match SIITEC"] = maestro[
+        "Carrera"
+    ].apply(simplificar_carrera)
+
+    maestro["__MASTER Clave nombre carrera SIITEC"] = (
+        maestro["__MASTER Nombre match SIITEC"].fillna("").astype(str)
+        + "||"
+        + maestro["__MASTER Carrera match SIITEC"].fillna("").astype(str)
+    )
+
+    maestro["__MASTER Clave tokens carrera SIITEC"] = (
+        maestro["__MASTER Nombre tokens SIITEC"].fillna("").astype(str)
+        + "||"
+        + maestro["__MASTER Carrera match SIITEC"].fillna("").astype(str)
+    )
+
+    # Helpers SIITEC.
+    sitec["__SIITEC Clave nombre carrera"] = (
+        sitec["__SIITEC Nombre match"].fillna("").astype(str)
+        + "||"
+        + sitec["__SIITEC Carrera match"].fillna("").astype(str)
+    )
+
+    sitec["__SIITEC Clave tokens carrera"] = (
+        sitec["__SIITEC Nombre tokens match"].fillna("").astype(str)
+        + "||"
+        + sitec["__SIITEC Carrera match"].fillna("").astype(str)
+    )
+
+    columnas_helper_sitec = {
+        "__SIITEC Nombre completo cruce",
+        "__SIITEC Nombre match",
+        "__SIITEC Nombre tokens match",
+        "__SIITEC Carrera visible",
+        "__SIITEC Carrera match",
+        "__SIITEC Clave nombre carrera",
+        "__SIITEC Clave tokens carrera"
+    }
+
+    # Todas las columnas originales de SIITEC se conservarán.
+    columnas_originales_sitec = [
+        columna
+        for columna in sitec.columns
+        if columna not in columnas_helper_sitec
+    ]
+
+    # Crear columnas destino desde el inicio.
+    for columna in columnas_originales_sitec:
+        destino = f"SIITEC · {columna}"
+        if destino not in maestro.columns:
+            maestro[destino] = np.nan
+
+    maestro["Estatus cruce SIITEC"] = "No encontrado"
+    maestro["Método cruce SIITEC"] = "No encontrado"
+
+    # --------------------------------------------------------
+    # Construcción de lookups únicos.
+    # --------------------------------------------------------
+    def crear_lookup_unico(df, columna_clave):
+        base = df[
+            df[columna_clave]
+            .fillna("")
+            .astype(str)
+            .str.strip() != ""
+        ].copy()
+
+        conteos = base[columna_clave].value_counts(dropna=False)
+        claves_unicas = set(conteos[conteos == 1].index.tolist())
+
+        lookup = {}
+
+        for idx, fila in base.iterrows():
+            clave = fila[columna_clave]
+            if clave in claves_unicas:
+                lookup[clave] = (idx, fila)
+
+        return lookup
+
+    lookup_nombre_carrera = crear_lookup_unico(
+        sitec,
+        "__SIITEC Clave nombre carrera"
+    )
+    lookup_tokens_carrera = crear_lookup_unico(
+        sitec,
+        "__SIITEC Clave tokens carrera"
+    )
+    lookup_nombre = crear_lookup_unico(
+        sitec,
+        "__SIITEC Nombre match"
+    )
+    lookup_tokens = crear_lookup_unico(
+        sitec,
+        "__SIITEC Nombre tokens match"
+    )
+
+    # Unicidad también en Master para respaldos sin carrera.
+    conteo_master_nombre = maestro[
+        "__MASTER Nombre match SIITEC"
+    ].value_counts()
+
+    conteo_master_tokens = maestro[
+        "__MASTER Nombre tokens SIITEC"
+    ].value_counts()
+
+    indices_sitec_usados = set()
+
+    def copiar_sitec(idx_master, idx_sitec, fila_sitec, metodo):
+        if idx_sitec in indices_sitec_usados:
+            return False
+
+        for columna in columnas_originales_sitec:
+            maestro.at[
+                idx_master,
+                f"SIITEC · {columna}"
+            ] = fila_sitec.get(columna, np.nan)
+
+        maestro.at[
+            idx_master,
+            "Estatus cruce SIITEC"
+        ] = "Vinculado"
+
+        maestro.at[
+            idx_master,
+            "Método cruce SIITEC"
+        ] = metodo
+
+        indices_sitec_usados.add(idx_sitec)
+        return True
+
+    for idx_master in maestro.index:
+        encontrado = None
+        metodo = None
+
+        clave_nombre_carrera = maestro.at[
+            idx_master,
+            "__MASTER Clave nombre carrera SIITEC"
+        ]
+
+        clave_tokens_carrera = maestro.at[
+            idx_master,
+            "__MASTER Clave tokens carrera SIITEC"
+        ]
+
+        nombre = maestro.at[
+            idx_master,
+            "__MASTER Nombre match SIITEC"
+        ]
+
+        tokens = maestro.at[
+            idx_master,
+            "__MASTER Nombre tokens SIITEC"
+        ]
+
+        # 1. Nombre + carrera.
+        if (
+            clave_nombre_carrera
+            and not clave_nombre_carrera.endswith("||")
+            and clave_nombre_carrera in lookup_nombre_carrera
+        ):
+            encontrado = lookup_nombre_carrera[clave_nombre_carrera]
+            metodo = "Nombre y carrera"
+
+        # 2. Tokens + carrera.
+        elif (
+            clave_tokens_carrera
+            and not clave_tokens_carrera.endswith("||")
+            and clave_tokens_carrera in lookup_tokens_carrera
+        ):
+            encontrado = lookup_tokens_carrera[clave_tokens_carrera]
+            metodo = "Nombre sin importar orden y carrera"
+
+        # 3. Nombre único.
+        elif (
+            nombre
+            and conteo_master_nombre.get(nombre, 0) == 1
+            and nombre in lookup_nombre
+        ):
+            encontrado = lookup_nombre[nombre]
+            metodo = "Nombre único"
+
+        # 4. Tokens únicos.
+        elif (
+            tokens
+            and conteo_master_tokens.get(tokens, 0) == 1
+            and tokens in lookup_tokens
+        ):
+            encontrado = lookup_tokens[tokens]
+            metodo = "Nombre único sin importar orden"
+
+        if encontrado is not None:
+            idx_sitec, fila_sitec = encontrado
+            copiar_sitec(
+                idx_master,
+                idx_sitec,
+                fila_sitec,
+                metodo
+            )
+
+    # --------------------------------------------------------
+    # Bases auxiliares para auditoría.
+    # --------------------------------------------------------
+    df_sitec_no_vinculados = sitec.loc[
+        ~sitec.index.isin(indices_sitec_usados)
+    ].copy()
+
+    df_sitec_vinculados = sitec.loc[
+        sitec.index.isin(indices_sitec_usados)
+    ].copy()
+
+    # Quitar helpers internos de los dataframes auxiliares.
+    helpers = [
+        columna
+        for columna in sitec.columns
+        if columna.startswith("__SIITEC")
+    ]
+
+    df_sitec_no_vinculados = df_sitec_no_vinculados.drop(
+        columns=helpers,
+        errors="ignore"
+    )
+    df_sitec_vinculados = df_sitec_vinculados.drop(
+        columns=helpers,
+        errors="ignore"
+    )
+
+    # Quitar helpers internos del Concentrado maestro.
+    helpers_master = [
+        columna
+        for columna in maestro.columns
+        if columna.startswith("__MASTER")
+    ]
+
+    maestro = maestro.drop(
+        columns=helpers_master,
+        errors="ignore"
+    )
+
+    return (
+        maestro,
+        df_sitec_vinculados.reset_index(drop=True),
+        df_sitec_no_vinculados.reset_index(drop=True)
+    )
 
 
 # ============================================================
@@ -3189,6 +3707,790 @@ def generar_concentrado_maestro(
 
 
 
+
+# ============================================================
+# CLUSTERING INTEGRAL SIITEC
+# ============================================================
+
+def sitec_es_columna_sensible_o_identificadora(nombre_columna):
+    """
+    Excluye del clustering variables que identifican directamente al aspirante
+    o que no aportan significado analítico al agrupamiento.
+
+    Los datos permanecen en el Concentrado maestro; únicamente se excluyen
+    de la matriz usada por el modelo.
+    """
+    texto = util_limpiar_texto(nombre_columna)
+
+    exclusiones = [
+        "id aspirante",
+        "id_aspirante",
+        "matricula",
+        "matrícula",
+        "curp",
+        "nombre",
+        "apellido",
+        "correo",
+        "email",
+        "telefono",
+        "teléfono",
+        "celular",
+        "domicilio",
+        "direccion",
+        "dirección",
+        "calle",
+        "numero exterior",
+        "numero interior",
+        "cp",
+        "codigo postal",
+        "código postal",
+        "fecha nacimiento",
+        "lugar nacimiento",
+        "hoja origen"
+    ]
+
+    return any(expresion in texto for expresion in exclusiones)
+
+
+def sitec_convertir_numero(valor):
+    """
+    Conversión flexible a número para variables SIITEC.
+    """
+    if pd.isna(valor):
+        return np.nan
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        return float(valor)
+
+    texto = str(valor).strip().lower()
+
+    if texto in {"", "nan", "none", "sin dato", "n/a", "na"}:
+        return np.nan
+
+    texto = (
+        texto.replace("$", "")
+        .replace("%", "")
+        .replace(",", "")
+        .replace(" ", "")
+    )
+
+    try:
+        return float(texto)
+    except Exception:
+        return np.nan
+
+
+def sitec_es_si(valor):
+    """
+    Detecta respuestas afirmativas comunes.
+    """
+    texto = util_limpiar_texto(valor)
+
+    afirmativos = {
+        "si", "sí", "s", "1", "true", "verdadero",
+        "yes", "tiene", "cuenta con"
+    }
+
+    if texto in afirmativos:
+        return 1.0
+
+    if texto in {"no", "n", "0", "false", "falso"}:
+        return 0.0
+
+    return np.nan
+
+
+def sitec_contiene_texto_util(valor):
+    """
+    Convierte campos abiertos de salud u otros antecedentes en indicador
+    de presencia de información declarada.
+    """
+    if pd.isna(valor):
+        return 0.0
+
+    texto = util_limpiar_texto(valor)
+
+    valores_vacios = {
+        "", "nan", "none", "ninguno", "ninguna", "no",
+        "sin dato", "no aplica", "n/a", "na", "-"
+    }
+
+    return 0.0 if texto in valores_vacios else 1.0
+
+
+def sitec_buscar_columna_original(df_maestro, candidatos):
+    """
+    Busca dentro de las columnas SIITEC · <campo> ignorando acentos,
+    mayúsculas, guiones y subrayados.
+    """
+    columnas_sitec = [
+        columna for columna in df_maestro.columns
+        if str(columna).startswith("SIITEC · ")
+    ]
+
+    mapa = {}
+
+    for columna in columnas_sitec:
+        base = str(columna).replace("SIITEC · ", "", 1)
+        clave = util_limpiar_texto(base)
+        clave = clave.replace("_", " ").replace("-", " ")
+        clave = re.sub(r"\s+", " ", clave).strip()
+        mapa[clave] = columna
+
+    for candidato in candidatos:
+        clave = util_limpiar_texto(candidato)
+        clave = clave.replace("_", " ").replace("-", " ")
+        clave = re.sub(r"\s+", " ", clave).strip()
+
+        if clave in mapa:
+            return mapa[clave]
+
+    return None
+
+
+def sitec_construir_variables_cluster(df_maestro):
+    """
+    Construye una matriz analítica SIITEC.
+
+    Se priorizan variables con sentido para permanencia y apoyos:
+    - contexto económico y familiar;
+    - vivienda y conectividad;
+    - salud declarada;
+    - características sociodemográficas no identificadoras.
+
+    No utiliza nombre, CURP, correo, domicilio ni identificadores.
+    """
+    base = pd.DataFrame(index=df_maestro.index)
+
+    # --------------------------------------------------------
+    # Variables numéricas principales
+    # --------------------------------------------------------
+    columnas_numericas = {
+        "SIITEC ingreso mensual": [
+            "ingreso mensual",
+            "ingreso_mensual",
+            "ingreso familiar",
+            "ingreso mensual familiar"
+        ],
+        "SIITEC habitantes en casa": [
+            "habitantes en casa",
+            "habitantes_casa",
+            "personas en casa",
+            "numero de habitantes"
+        ],
+        "SIITEC hijos": [
+            "numero de hijos",
+            "número de hijos",
+            "hijos"
+        ],
+        "SIITEC estado salud": [
+            "estado salud",
+            "estado_salud",
+            "estado de salud",
+            "salud"
+        ]
+    }
+
+    columnas_detectadas = {}
+
+    for nombre_salida, candidatos in columnas_numericas.items():
+        columna = sitec_buscar_columna_original(
+            df_maestro,
+            candidatos
+        )
+
+        if columna is not None:
+            base[nombre_salida] = df_maestro[columna].apply(
+                sitec_convertir_numero
+            )
+            columnas_detectadas[nombre_salida] = columna
+
+    # Ingreso per cápita, si existen ambas variables.
+    if (
+        "SIITEC ingreso mensual" in base.columns
+        and "SIITEC habitantes en casa" in base.columns
+    ):
+        habitantes = base["SIITEC habitantes en casa"].replace(0, np.nan)
+
+        base["SIITEC ingreso per cápita"] = (
+            base["SIITEC ingreso mensual"] / habitantes
+        )
+
+    # --------------------------------------------------------
+    # Variables binarias/indicadores
+    # --------------------------------------------------------
+    columnas_texto_indicador = {
+        "SIITEC enfermedad declarada": [
+            "enfermedades",
+            "enfermedad"
+        ],
+        "SIITEC discapacidad declarada": [
+            "discapacidades",
+            "discapacidad"
+        ],
+        "SIITEC especialista declarado": [
+            "especialistas",
+            "especialista"
+        ]
+    }
+
+    for nombre_salida, candidatos in columnas_texto_indicador.items():
+        columna = sitec_buscar_columna_original(
+            df_maestro,
+            candidatos
+        )
+
+        if columna is not None:
+            base[nombre_salida] = df_maestro[columna].apply(
+                sitec_contiene_texto_util
+            )
+            columnas_detectadas[nombre_salida] = columna
+
+    # --------------------------------------------------------
+    # Variables categóricas: one-hot con cardinalidad controlada.
+    # --------------------------------------------------------
+    candidatas_categoricas = {
+        "sexo": ["sexo", "genero", "género"],
+        "estado civil": ["estado civil", "estado_civil"],
+        "ocupacion": ["ocupacion", "ocupación"],
+        "vivienda": [
+            "propiedad de vivienda",
+            "propiedad_vivienda",
+            "tipo de vivienda",
+            "vivienda"
+        ],
+        "servicios": [
+            "servicios disponibles",
+            "servicios",
+            "servicios vivienda"
+        ],
+        "dispositivos": [
+            "dispositivos tecnologicos",
+            "dispositivos tecnológicos",
+            "dispositivos",
+            "equipo tecnologico"
+        ]
+    }
+
+    for prefijo, candidatos in candidatas_categoricas.items():
+        columna = sitec_buscar_columna_original(
+            df_maestro,
+            candidatos
+        )
+
+        if columna is None:
+            continue
+
+        serie = (
+            df_maestro[columna]
+            .fillna("Sin dato")
+            .astype(str)
+            .map(util_limpiar_texto_visible)
+        )
+
+        # Evitar variables abiertas con demasiadas categorías.
+        if serie.nunique(dropna=False) > 35:
+            continue
+
+        dummies = pd.get_dummies(
+            serie,
+            prefix=f"SIITEC {prefijo}",
+            dtype=float
+        )
+
+        # Eliminar categorías demasiado raras (<2%) para estabilidad.
+        if len(dummies) > 0:
+            prevalencias = dummies.mean(axis=0)
+            conservar = prevalencias[
+                (prevalencias >= 0.02)
+                & (prevalencias <= 0.98)
+            ].index.tolist()
+
+            if conservar:
+                base = pd.concat(
+                    [base, dummies[conservar]],
+                    axis=1
+                )
+
+        columnas_detectadas[
+            f"SIITEC categórica {prefijo}"
+        ] = columna
+
+    # --------------------------------------------------------
+    # Respaldo: variables SIITEC numéricas no sensibles.
+    # --------------------------------------------------------
+    for columna in df_maestro.columns:
+        if not str(columna).startswith("SIITEC · "):
+            continue
+
+        base_original = str(columna).replace("SIITEC · ", "", 1)
+
+        if sitec_es_columna_sensible_o_identificadora(base_original):
+            continue
+
+        if columna in columnas_detectadas.values():
+            continue
+
+        serie_num = df_maestro[columna].apply(
+            sitec_convertir_numero
+        )
+
+        proporcion_valida = serie_num.notna().mean()
+
+        if (
+            proporcion_valida >= 0.60
+            and serie_num.nunique(dropna=True) > 1
+            and serie_num.nunique(dropna=True) <= max(150, int(len(df_maestro) * 0.5))
+        ):
+            nombre_salida = f"SIITEC num · {base_original}"
+            if nombre_salida not in base.columns:
+                base[nombre_salida] = serie_num
+
+    # Eliminar variables vacías, constantes o casi vacías.
+    columnas_validas = []
+
+    for columna in base.columns:
+        serie = pd.to_numeric(base[columna], errors="coerce")
+
+        if serie.notna().sum() < max(20, int(len(base) * 0.30)):
+            continue
+
+        if serie.nunique(dropna=True) <= 1:
+            continue
+
+        columnas_validas.append(columna)
+
+    base = base[columnas_validas].copy()
+
+    return base, columnas_detectadas
+
+
+def sitec_seleccionar_k(X, random_state=42):
+    """
+    Selecciona k entre 2 y 6 mediante Silueta y Davies-Bouldin.
+    """
+    n = len(X)
+
+    if n < 10:
+        return None, pd.DataFrame()
+
+    k_max = min(6, n - 1)
+    resultados = []
+
+    for k in range(2, k_max + 1):
+        modelo = KMeans(
+            n_clusters=k,
+            random_state=random_state,
+            n_init=30
+        )
+
+        etiquetas = modelo.fit_predict(X)
+        conteos = pd.Series(etiquetas).value_counts()
+
+        if len(conteos) < 2:
+            continue
+
+        silueta = silhouette_score(X, etiquetas)
+        davies = davies_bouldin_score(X, etiquetas)
+
+        minimo = int(conteos.min())
+        proporcion_minima = minimo / n
+
+        # Penalización suave para grupos residuales.
+        penalizacion = (
+            0.10 if proporcion_minima < 0.03
+            else 0.05 if proporcion_minima < 0.05
+            else 0.0
+        )
+
+        resultados.append({
+            "k": int(k),
+            "Silueta": float(silueta),
+            "Davies-Bouldin": float(davies),
+            "Inercia": float(modelo.inertia_),
+            "Mínimo integrantes": minimo,
+            "Proporción mínima": float(proporcion_minima),
+            "Puntuación selección": float(silueta - penalizacion)
+        })
+
+    metricas = pd.DataFrame(resultados)
+
+    if metricas.empty:
+        return None, metricas
+
+    mejor = metricas.sort_values(
+        ["Puntuación selección", "Davies-Bouldin"],
+        ascending=[False, True]
+    ).iloc[0]
+
+    return int(mejor["k"]), metricas
+
+
+def sitec_asignar_perfiles(df, matriz_original, etiquetas):
+    """
+    Genera nombres neutrales para los clusters SIITEC.
+
+    Los nombres son deliberadamente descriptivos y no clínicos.
+    El HTML podrá reinterpretarlos después con reglas de apoyo.
+    """
+    salida = df.copy()
+    salida["Cluster SIITEC"] = pd.Series(
+        etiquetas,
+        index=salida.index,
+        dtype="Int64"
+    )
+
+    # Índice contextual interno para ordenar perfiles.
+    # Ingreso/recursos suman; necesidades de salud restan.
+    indicadores = pd.DataFrame(index=matriz_original.index)
+
+    columnas_positivas = [
+        columna for columna in matriz_original.columns
+        if (
+            "ingreso per cápita" in columna
+            or "ingreso mensual" in columna
+        )
+    ]
+
+    columnas_necesidad = [
+        columna for columna in matriz_original.columns
+        if any(
+            texto in columna
+            for texto in [
+                "enfermedad declarada",
+                "discapacidad declarada",
+                "especialista declarado"
+            ]
+        )
+    ]
+
+    columnas_salud = [
+        columna for columna in matriz_original.columns
+        if columna == "SIITEC estado salud"
+    ]
+
+    for columna in columnas_positivas:
+        serie = pd.to_numeric(
+            matriz_original[columna],
+            errors="coerce"
+        )
+        desviacion = serie.std(ddof=0)
+
+        if desviacion and not pd.isna(desviacion):
+            indicadores[f"+{columna}"] = (
+                serie - serie.mean()
+            ) / desviacion
+
+    for columna in columnas_salud:
+        serie = pd.to_numeric(
+            matriz_original[columna],
+            errors="coerce"
+        )
+        desviacion = serie.std(ddof=0)
+
+        if desviacion and not pd.isna(desviacion):
+            indicadores[f"+{columna}"] = (
+                serie - serie.mean()
+            ) / desviacion
+
+    for columna in columnas_necesidad:
+        serie = pd.to_numeric(
+            matriz_original[columna],
+            errors="coerce"
+        )
+        desviacion = serie.std(ddof=0)
+
+        if desviacion and not pd.isna(desviacion):
+            indicadores[f"-{columna}"] = -(
+                (serie - serie.mean()) / desviacion
+            )
+
+    if indicadores.empty:
+        salida["Índice contextual SIITEC"] = np.nan
+    else:
+        salida["Índice contextual SIITEC"] = (
+            indicadores.mean(axis=1)
+        )
+
+    resumen_indice = (
+        salida.groupby("Cluster SIITEC")[
+            "Índice contextual SIITEC"
+        ]
+        .mean()
+        .sort_values()
+    )
+
+    orden_clusters = resumen_indice.index.tolist()
+
+    if not orden_clusters:
+        orden_clusters = sorted(
+            salida["Cluster SIITEC"].dropna().unique().tolist()
+        )
+
+    nombres = {}
+
+    k = len(orden_clusters)
+
+    if k == 2:
+        etiquetas_nombre = [
+            "Perfil SIITEC A · Mayor necesidad de acompañamiento",
+            "Perfil SIITEC B · Condiciones relativamente favorables"
+        ]
+    elif k == 3:
+        etiquetas_nombre = [
+            "Perfil SIITEC A · Mayor necesidad de acompañamiento",
+            "Perfil SIITEC B · Condiciones intermedias",
+            "Perfil SIITEC C · Condiciones relativamente favorables"
+        ]
+    elif k == 4:
+        etiquetas_nombre = [
+            "Perfil SIITEC A · Mayor necesidad de acompañamiento",
+            "Perfil SIITEC B · Necesidad moderada de apoyo",
+            "Perfil SIITEC C · Condiciones intermedias favorables",
+            "Perfil SIITEC D · Condiciones relativamente favorables"
+        ]
+    else:
+        etiquetas_nombre = [
+            f"Perfil SIITEC {chr(65+i)}"
+            for i in range(k)
+        ]
+
+    for posicion, cluster in enumerate(orden_clusters):
+        nombres[cluster] = etiquetas_nombre[posicion]
+
+    salida["Perfil SIITEC"] = salida[
+        "Cluster SIITEC"
+    ].map(nombres)
+
+    return salida
+
+
+def aplicar_clustering_sitec(df_maestro, random_state=42):
+    """
+    Aplica clustering exclusivamente con variables SIITEC.
+
+    No genera visualizaciones en Streamlit.
+
+    Devuelve:
+    - Concentrado maestro enriquecido con cluster/perfil SIITEC.
+    - Resumen de perfiles SIITEC.
+    - Métricas para selección de k.
+    """
+    df = df_maestro.copy()
+
+    if (
+        "Estatus cruce SIITEC" not in df.columns
+        or (df["Estatus cruce SIITEC"] == "Vinculado").sum() < 10
+    ):
+        df["Cluster SIITEC"] = pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        )
+        df["Perfil SIITEC"] = "Sin segmentación SIITEC"
+        df["K SIITEC"] = pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        )
+        df["Silueta SIITEC"] = np.nan
+        df["Davies-Bouldin SIITEC"] = np.nan
+        df["Distancia centroide SIITEC"] = np.nan
+        df["Índice contextual SIITEC"] = np.nan
+        df["Variables clustering SIITEC"] = ""
+
+        return df, pd.DataFrame(), pd.DataFrame()
+
+    vinculados = df[
+        df["Estatus cruce SIITEC"] == "Vinculado"
+    ].copy()
+
+    matriz_original, columnas_detectadas = (
+        sitec_construir_variables_cluster(vinculados)
+    )
+
+    if matriz_original.shape[1] < 2:
+        df["Cluster SIITEC"] = pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        )
+        df["Perfil SIITEC"] = "Datos SIITEC insuficientes para segmentar"
+        df["K SIITEC"] = pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        )
+        df["Silueta SIITEC"] = np.nan
+        df["Davies-Bouldin SIITEC"] = np.nan
+        df["Distancia centroide SIITEC"] = np.nan
+        df["Índice contextual SIITEC"] = np.nan
+        df["Variables clustering SIITEC"] = ""
+
+        return df, pd.DataFrame(), pd.DataFrame()
+
+    imputador = SimpleImputer(strategy="median")
+    escalador = StandardScaler()
+
+    X_imputado = imputador.fit_transform(
+        matriz_original
+    )
+    X = escalador.fit_transform(
+        X_imputado
+    )
+
+    k, metricas = sitec_seleccionar_k(
+        X,
+        random_state=random_state
+    )
+
+    if k is None:
+        return df, pd.DataFrame(), metricas
+
+    modelo = KMeans(
+        n_clusters=k,
+        random_state=random_state,
+        n_init=30
+    )
+
+    etiquetas = modelo.fit_predict(X)
+
+    distancias = np.linalg.norm(
+        X - modelo.cluster_centers_[etiquetas],
+        axis=1
+    )
+
+    vinculados = sitec_asignar_perfiles(
+        vinculados,
+        matriz_original,
+        etiquetas
+    )
+
+    vinculados["Distancia centroide SIITEC"] = distancias
+
+    mejor = metricas[
+        metricas["k"] == k
+    ].iloc[0]
+
+    vinculados["K SIITEC"] = int(k)
+    vinculados["Silueta SIITEC"] = float(
+        mejor["Silueta"]
+    )
+    vinculados["Davies-Bouldin SIITEC"] = float(
+        mejor["Davies-Bouldin"]
+    )
+    vinculados["Variables clustering SIITEC"] = ", ".join(
+        matriz_original.columns.tolist()
+    )
+
+    # Inicializar columnas en el maestro completo.
+    df["Cluster SIITEC"] = pd.Series(
+        pd.NA,
+        index=df.index,
+        dtype="Int64"
+    )
+    df["Perfil SIITEC"] = "Sin segmentación SIITEC"
+    df["K SIITEC"] = pd.Series(
+        pd.NA,
+        index=df.index,
+        dtype="Int64"
+    )
+    df["Silueta SIITEC"] = np.nan
+    df["Davies-Bouldin SIITEC"] = np.nan
+    df["Distancia centroide SIITEC"] = np.nan
+    df["Índice contextual SIITEC"] = np.nan
+    df["Variables clustering SIITEC"] = ""
+
+    columnas_resultado = [
+        "Cluster SIITEC",
+        "Perfil SIITEC",
+        "K SIITEC",
+        "Silueta SIITEC",
+        "Davies-Bouldin SIITEC",
+        "Distancia centroide SIITEC",
+        "Índice contextual SIITEC",
+        "Variables clustering SIITEC"
+    ]
+
+    for columna in columnas_resultado:
+        df.loc[
+            vinculados.index,
+            columna
+        ] = vinculados[columna].values
+
+    # Resumen por perfil.
+    resumenes = []
+
+    for perfil, grupo in vinculados.groupby(
+        "Perfil SIITEC",
+        dropna=False
+    ):
+        registro = {
+            "Perfil SIITEC": perfil,
+            "Cluster SIITEC": int(
+                grupo["Cluster SIITEC"].iloc[0]
+            ),
+            "Estudiantes": len(grupo),
+            "Porcentaje vinculados": round(
+                100 * len(grupo) / len(vinculados),
+                1
+            ),
+            "Índice contextual SIITEC": pd.to_numeric(
+                grupo["Índice contextual SIITEC"],
+                errors="coerce"
+            ).mean(),
+            "K SIITEC": int(k),
+            "Silueta SIITEC": float(
+                mejor["Silueta"]
+            ),
+            "Davies-Bouldin SIITEC": float(
+                mejor["Davies-Bouldin"]
+            )
+        }
+
+        # Añadir medias de las variables numéricas más interpretables.
+        for columna in [
+            "SIITEC ingreso mensual",
+            "SIITEC habitantes en casa",
+            "SIITEC ingreso per cápita",
+            "SIITEC hijos",
+            "SIITEC estado salud",
+            "SIITEC enfermedad declarada",
+            "SIITEC discapacidad declarada",
+            "SIITEC especialista declarado"
+        ]:
+            if columna in matriz_original.columns:
+                valores = pd.to_numeric(
+                    matriz_original.loc[
+                        grupo.index,
+                        columna
+                    ],
+                    errors="coerce"
+                )
+                registro[
+                    f"Media · {columna}"
+                ] = valores.mean()
+
+        resumenes.append(registro)
+
+    resumen = pd.DataFrame(resumenes)
+
+    if not resumen.empty:
+        resumen = resumen.sort_values(
+            "Índice contextual SIITEC",
+            ascending=True,
+            na_position="last"
+        ).reset_index(drop=True)
+
+    metricas = metricas.copy()
+    metricas["K seleccionado"] = int(k)
+    metricas["Variables usadas"] = ", ".join(
+        matriz_original.columns.tolist()
+    )
+
+    return df, resumen, metricas
+
+
 # ============================================================
 # CLUSTERING ACADÉMICO POR CARRERA
 # ============================================================
@@ -3607,6 +4909,29 @@ def generar_excel_maestro(df_maestro):
         pd.DataFrame()
     )
 
+    df_sitec_fuente = st.session_state.get(
+        "df_sitec_fuente",
+        pd.DataFrame()
+    )
+    df_sitec_vinculados = st.session_state.get(
+        "df_sitec_vinculados",
+        pd.DataFrame()
+    )
+    df_sitec_no_vinculados = st.session_state.get(
+        "df_sitec_no_vinculados",
+        pd.DataFrame()
+    )
+
+    df_resumen_clusters_sitec = st.session_state.get(
+        "df_resumen_clusters_sitec",
+        pd.DataFrame()
+    )
+
+    df_metricas_clusters_sitec = st.session_state.get(
+        "df_metricas_clusters_sitec",
+        pd.DataFrame()
+    )
+
     resumen_carrera = (
         df_maestro
         .groupby("Carrera", dropna=False)
@@ -3723,6 +5048,42 @@ def generar_excel_maestro(df_maestro):
                 sheet_name="Listas prioritarias"
             )
 
+        # SIITEC: conservar fuente y auditoría de cruces.
+        if not df_sitec_fuente.empty:
+            df_sitec_fuente.to_excel(
+                writer,
+                index=False,
+                sheet_name="SIITEC fuente"
+            )
+
+        if not df_sitec_vinculados.empty:
+            df_sitec_vinculados.to_excel(
+                writer,
+                index=False,
+                sheet_name="SIITEC vinculados"
+            )
+
+        if not df_sitec_no_vinculados.empty:
+            df_sitec_no_vinculados.to_excel(
+                writer,
+                index=False,
+                sheet_name="SIITEC no vinculados"
+            )
+
+        if not df_resumen_clusters_sitec.empty:
+            df_resumen_clusters_sitec.to_excel(
+                writer,
+                index=False,
+                sheet_name="SIITEC perfiles"
+            )
+
+        if not df_metricas_clusters_sitec.empty:
+            df_metricas_clusters_sitec.to_excel(
+                writer,
+                index=False,
+                sheet_name="SIITEC métricas cluster"
+            )
+
         workbook = writer.book
 
         for nombre_hoja in workbook.sheetnames:
@@ -3768,7 +5129,7 @@ def render_app_maestra():
     st.title("📚 Generador de Concentrado Maestro de Aspirantes")
 
     st.caption(
-        "Integra Historial de Aspirantes, EVALUATEC y CHASIDE "
+        "Integra Historial de Aspirantes, EVALUATEC, CHASIDE y SIITEC "
         "en un único archivo Excel para alimentar el dashboard HTML."
     )
 
@@ -3845,6 +5206,30 @@ def render_app_maestra():
     st.caption(
         f"Intereses: {peso_intereses:.1f} · "
         f"Aptitudes: {peso_aptitudes:.1f}"
+    )
+
+    st.markdown("### SIITEC")
+
+    url_sitec = st.text_input(
+        "Link del Excel / Google Sheets de SIITEC",
+        value=LINK_SIITEC_DEFAULT,
+        key="url_sitec_maestro",
+        help=(
+            "Pega el enlace público de SIITEC. "
+            "Si cargas un archivo manualmente, la carga manual tendrá prioridad."
+        )
+    )
+
+    archivo_sitec = st.file_uploader(
+        "Carga manual opcional de SIITEC",
+        type=["xlsx", "xls"],
+        key="archivo_sitec_maestro"
+    )
+
+    st.caption(
+        "SIITEC se integra completo al Concentrado maestro y se calcula "
+        "un clustering SIITEC en segundo plano. No se muestran visualizaciones "
+        "en Streamlit; los resultados quedan disponibles para el HTML."
     )
 
     st.markdown("---")
@@ -4013,6 +5398,41 @@ def render_app_maestra():
             else:
                 df_chaside_procesado = pd.DataFrame()
 
+            # --------------------------------------------------------
+            # Procesamiento SIITEC
+            # --------------------------------------------------------
+            contenido_sitec = obtener_contenido_sitec_desde_link_o_upload(
+                url_sitec=url_sitec,
+                archivo_sitec=archivo_sitec
+            )
+
+            if contenido_sitec is not None:
+                with st.spinner("Procesando SIITEC..."):
+                    try:
+                        df_sitec_fuente = sitec_leer_excel(
+                            contenido_sitec
+                        )
+
+                        if df_sitec_fuente.empty:
+                            raise ValueError(
+                                "El archivo SIITEC no contiene registros legibles."
+                            )
+
+                        df_sitec_preparado = sitec_preparar_para_cruce(
+                            df_sitec_fuente
+                        )
+
+                    except Exception as error:
+                        st.warning(
+                            "SIITEC no pudo procesarse. "
+                            f"Se continuará sin SIITEC. Detalle: {error}"
+                        )
+                        df_sitec_fuente = pd.DataFrame()
+                        df_sitec_preparado = pd.DataFrame()
+            else:
+                df_sitec_fuente = pd.DataFrame()
+                df_sitec_preparado = pd.DataFrame()
+
             with st.spinner("Construyendo el Concentrado maestro..."):
                 df_maestro = generar_concentrado_maestro(
                     df_historial_preparado=df_historial_preparado,
@@ -4025,6 +5445,28 @@ def render_app_maestra():
                         "El Concentrado maestro quedó vacío."
                     )
                     st.stop()
+
+                # ----------------------------------------------------
+                # Integración SIITEC al Master
+                # ----------------------------------------------------
+                (
+                    df_maestro,
+                    df_sitec_vinculados,
+                    df_sitec_no_vinculados
+                ) = integrar_sitec_en_maestro(
+                    df_maestro=df_maestro,
+                    df_sitec_preparado=df_sitec_preparado
+                )
+
+                st.session_state["df_sitec_fuente"] = (
+                    df_sitec_fuente.copy()
+                )
+                st.session_state["df_sitec_vinculados"] = (
+                    df_sitec_vinculados.copy()
+                )
+                st.session_state["df_sitec_no_vinculados"] = (
+                    df_sitec_no_vinculados.copy()
+                )
 
                 # Validación obligatoria del propedéutico.
                 columnas_propedeutico = [
@@ -4079,8 +5521,27 @@ def render_app_maestra():
                         "leídos desde el enlace o la carga manual."
                     )
 
-                # Se conserva la segmentación en los datos de salida,
-                # aunque ya no se muestra dentro de Streamlit.
+                # ----------------------------------------------------
+                # Clustering SIITEC en segundo plano
+                # ----------------------------------------------------
+                (
+                    df_maestro,
+                    df_resumen_clusters_sitec,
+                    df_metricas_clusters_sitec
+                ) = aplicar_clustering_sitec(
+                    df_maestro
+                )
+
+                st.session_state[
+                    "df_resumen_clusters_sitec"
+                ] = df_resumen_clusters_sitec.copy()
+
+                st.session_state[
+                    "df_metricas_clusters_sitec"
+                ] = df_metricas_clusters_sitec.copy()
+
+                # Se conserva la segmentación académica existente.
+                # Ninguno de los dos clustering se visualiza en Streamlit.
                 (
                     df_maestro,
                     df_resumen_clusters,
@@ -4115,12 +5576,31 @@ def render_app_maestra():
                 errors="coerce"
             ).notna().sum()
 
+            total_sitec_vinculados = (
+                int(
+                    (
+                        df_maestro["Estatus cruce SIITEC"] == "Vinculado"
+                    ).sum()
+                )
+                if "Estatus cruce SIITEC" in df_maestro.columns
+                else 0
+            )
+
+            total_sitec_no_vinculados = len(
+                st.session_state.get(
+                    "df_sitec_no_vinculados",
+                    pd.DataFrame()
+                )
+            )
+
             st.success(
                 "Concentrado generado correctamente: "
                 f"{len(df_maestro):,} registros. "
                 f"Ciencias Básicas recuperadas: {total_prop_basicas:,}. "
                 f"Evaluaciones departamentales recuperadas: "
-                f"{total_prop_departamento:,}."
+                f"{total_prop_departamento:,}. "
+                f"SIITEC vinculados: {total_sitec_vinculados:,}. "
+                f"SIITEC sin vínculo: {total_sitec_no_vinculados:,}."
             )
 
         except Exception as error:
@@ -4193,6 +5673,10 @@ def validar_funciones_requeridas():
         "eval_procesar_archivo",
         "chaside_cargar_respuestas",
         "chaside_procesar_respuestas",
+        "sitec_leer_excel",
+        "sitec_preparar_para_cruce",
+        "integrar_sitec_en_maestro",
+        "aplicar_clustering_sitec",
         "preparar_historial_para_cruce",
         "preparar_evaluatec_desde_bloques",
         "generar_concentrado_maestro",
