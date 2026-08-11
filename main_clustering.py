@@ -2936,58 +2936,196 @@ def chaside_procesar_respuestas(
         columnas_puntaje
     ].max(axis=1)
 
-    def carrera_mejor_ubicada(fila):
-        if fila["Respuesta plana CHASIDE"]:
-            return "Requiere realizar o repetir la escala CHASIDE"
-
-        area_fuerte = fila["Área fuerte principal CHASIDE"]
-        carrera_actual = str(fila["Carrera elegida CHASIDE"]).strip()
-
-        sugeridas = [
-            carrera
-            for carrera, areas in CHASIDE_PERFILES_CARRERA.items()
-            if area_fuerte in areas
-        ]
-
-        if carrera_actual in sugeridas:
-            return carrera_actual
-
-        if sugeridas:
-            return ", ".join(sugeridas)
-
-        return "Sin sugerencia clara"
-
-    nuevas_columnas["Diagnóstico CHASIDE"] = nuevas_columnas.apply(
-        carrera_mejor_ubicada,
-        axis=1
-    )
-
     perfiles_simplificados = {
         simplificar_carrera(carrera): set(areas)
         for carrera, areas in CHASIDE_PERFILES_CARRERA.items()
     }
 
+    def extraer_area_fuerte(texto):
+        return str(texto).split("·")[0].strip()
+
     def calcular_coincidencia_perfil(fila):
         """
         1 si alguna de las dos áreas CHASIDE más fuertes pertenece al perfil
-        vocacional esperado de la carrera elegida; 0 si no coincide.
+        esperado de la carrera elegida; 0 si no coincide.
         """
         if fila["Respuesta plana CHASIDE"]:
             return np.nan
 
-        carrera = simplificar_carrera(fila["Carrera elegida CHASIDE"])
+        carrera = simplificar_carrera(
+            fila["Carrera elegida CHASIDE"]
+        )
         areas_esperadas = perfiles_simplificados.get(carrera)
+
         if not areas_esperadas:
             return np.nan
 
         areas_fuertes = {
-            str(fila["Área fuerte CHASIDE 1"]).split("·")[0].strip(),
-            str(fila["Área fuerte CHASIDE 2"]).split("·")[0].strip()
+            extraer_area_fuerte(fila["Área fuerte CHASIDE 1"]),
+            extraer_area_fuerte(fila["Área fuerte CHASIDE 2"])
         }
-        return float(len(areas_fuertes.intersection(areas_esperadas)) > 0)
+
+        return float(
+            len(areas_fuertes.intersection(areas_esperadas)) > 0
+        )
 
     nuevas_columnas["Coincidencia perfil vocacional CHASIDE"] = (
-        nuevas_columnas.apply(calcular_coincidencia_perfil, axis=1)
+        nuevas_columnas.apply(
+            calcular_coincidencia_perfil,
+            axis=1
+        )
+    )
+
+    def ranking_carreras_chaside(fila):
+        """
+        Ordena las carreras según compatibilidad con el perfil CHASIDE.
+
+        Criterios:
+        1. Cantidad de áreas fuertes (top 2) presentes en el perfil esperado.
+        2. Promedio del puntaje CHASIDE de las áreas asociadas a la carrera.
+        3. Puntaje del área fuerte principal como desempate indirecto.
+        """
+        if fila["Respuesta plana CHASIDE"]:
+            return []
+
+        top_2 = {
+            extraer_area_fuerte(fila["Área fuerte CHASIDE 1"]),
+            extraer_area_fuerte(fila["Área fuerte CHASIDE 2"])
+        }
+
+        ranking = []
+
+        for carrera, areas in CHASIDE_PERFILES_CARRERA.items():
+            areas = list(areas)
+
+            coincidencias_top = len(
+                top_2.intersection(set(areas))
+            )
+
+            puntajes = [
+                float(fila.get(f"CHASIDE Puntaje {area}", 0))
+                for area in areas
+                if pd.notna(
+                    fila.get(f"CHASIDE Puntaje {area}", np.nan)
+                )
+            ]
+
+            promedio_perfil = (
+                float(np.mean(puntajes))
+                if puntajes else 0.0
+            )
+
+            ranking.append(
+                {
+                    "Carrera": carrera,
+                    "Coincidencias top 2": coincidencias_top,
+                    "Promedio perfil": promedio_perfil
+                }
+            )
+
+        ranking = sorted(
+            ranking,
+            key=lambda x: (
+                x["Coincidencias top 2"],
+                x["Promedio perfil"]
+            ),
+            reverse=True
+        )
+
+        return ranking
+
+    def obtener_carrera_idonea(fila):
+        coincidencia = fila[
+            "Coincidencia perfil vocacional CHASIDE"
+        ]
+
+        if pd.isna(coincidencia):
+            return "Sin dato"
+
+        carrera_actual = str(
+            fila["Carrera elegida CHASIDE"]
+        ).strip()
+
+        if coincidencia == 1:
+            return carrera_actual
+
+        ranking = ranking_carreras_chaside(fila)
+
+        if not ranking:
+            return "Sin sugerencia clara"
+
+        return ranking[0]["Carrera"]
+
+    def obtener_carreras_compatibles(fila):
+        if fila["Respuesta plana CHASIDE"]:
+            return "Requiere realizar o repetir la escala CHASIDE"
+
+        ranking = ranking_carreras_chaside(fila)
+
+        if not ranking:
+            return "Sin sugerencia clara"
+
+        # Se muestran las tres alternativas con mayor compatibilidad.
+        carreras = [
+            item["Carrera"]
+            for item in ranking[:3]
+        ]
+
+        return ", ".join(carreras)
+
+    nuevas_columnas["Perfil vocacional coincide"] = (
+        nuevas_columnas[
+            "Coincidencia perfil vocacional CHASIDE"
+        ]
+        .map(
+            {
+                1.0: "Sí",
+                0.0: "No"
+            }
+        )
+        .fillna("Sin dato")
+    )
+
+    nuevas_columnas["Carrera idónea CHASIDE"] = (
+        nuevas_columnas.apply(
+            obtener_carrera_idonea,
+            axis=1
+        )
+    )
+
+    nuevas_columnas["Carreras compatibles CHASIDE"] = (
+        nuevas_columnas.apply(
+            obtener_carreras_compatibles,
+            axis=1
+        )
+    )
+
+    def diagnostico_chaside_claro(fila):
+        if fila["Respuesta plana CHASIDE"]:
+            return "Requiere realizar o repetir la escala CHASIDE"
+
+        coincide = fila["Perfil vocacional coincide"]
+
+        if coincide == "Sí":
+            return (
+                "Sí coincide con el perfil vocacional "
+                "de la carrera elegida"
+            )
+
+        if coincide == "No":
+            return (
+                "No coincide con el perfil esperado; "
+                f"carrera idónea sugerida: "
+                f"{fila['Carrera idónea CHASIDE']}"
+            )
+
+        return "No fue posible determinar la coincidencia vocacional"
+
+    nuevas_columnas["Diagnóstico CHASIDE"] = (
+        nuevas_columnas.apply(
+            diagnostico_chaside_claro,
+            axis=1
+        )
     )
 
     return nuevas_columnas.copy()
@@ -3374,7 +3512,11 @@ def buscar_chaside_para_estudiante(fila, df_chaside):
         "Carrera elegida CHASIDE": "Sin dato",
         "Área fuerte CHASIDE 1": "Sin dato", "Área fuerte CHASIDE 2": "Sin dato",
         "Área débil CHASIDE 1": "Sin dato", "Área débil CHASIDE 2": "Sin dato",
-        "Score CHASIDE": np.nan, "Coincidencia perfil vocacional CHASIDE": np.nan,
+        "Score CHASIDE": np.nan,
+        "Coincidencia perfil vocacional CHASIDE": np.nan,
+        "Perfil vocacional coincide": "Sin dato",
+        "Carrera idónea CHASIDE": "Sin dato",
+        "Carreras compatibles CHASIDE": "Sin dato",
         "Estatus cruce CHASIDE": "No encontrado"
     }
     if df_chaside is None or df_chaside.empty:
@@ -3433,7 +3575,22 @@ def buscar_chaside_para_estudiante(fila, df_chaside):
         "Área débil CHASIDE 1": mejor.get("Área débil CHASIDE 1", "Sin dato"),
         "Área débil CHASIDE 2": mejor.get("Área débil CHASIDE 2", "Sin dato"),
         "Score CHASIDE": mejor.get("Score CHASIDE", np.nan),
-        "Coincidencia perfil vocacional CHASIDE": mejor.get("Coincidencia perfil vocacional CHASIDE", np.nan),
+        "Coincidencia perfil vocacional CHASIDE": mejor.get(
+            "Coincidencia perfil vocacional CHASIDE",
+            np.nan
+        ),
+        "Perfil vocacional coincide": mejor.get(
+            "Perfil vocacional coincide",
+            "Sin dato"
+        ),
+        "Carrera idónea CHASIDE": mejor.get(
+            "Carrera idónea CHASIDE",
+            "Sin dato"
+        ),
+        "Carreras compatibles CHASIDE": mejor.get(
+            "Carreras compatibles CHASIDE",
+            "Sin dato"
+        ),
         "Estatus cruce CHASIDE": estatus
     }
 
@@ -3778,7 +3935,18 @@ def generar_concentrado_maestro(
             "Coincidencia CHASIDE": resultado_chaside[
                 "Coincidencia perfil vocacional CHASIDE"
             ],
-            "Estatus cruce CHASIDE": resultado_chaside["Estatus cruce CHASIDE"]
+            "Perfil vocacional coincide": resultado_chaside[
+                "Perfil vocacional coincide"
+            ],
+            "Carrera idónea CHASIDE": resultado_chaside[
+                "Carrera idónea CHASIDE"
+            ],
+            "Carreras compatibles CHASIDE": resultado_chaside[
+                "Carreras compatibles CHASIDE"
+            ],
+            "Estatus cruce CHASIDE": resultado_chaside[
+                "Estatus cruce CHASIDE"
+            ]
         }
 
         for codigo in EVAL_ORDEN_AREAS:
@@ -3816,6 +3984,310 @@ def generar_concentrado_maestro(
     return df_maestro
 
 
+
+
+
+# ============================================================
+# PERFIL INTEGRAL: VARIABLES DERIVADAS Y CATEGORÍAS POR CARRERA
+# ============================================================
+
+def categoria_bajo_regular_alto(
+    serie_referencia,
+    valor
+):
+    """
+    Clasifica una variable continua como Bajo / Regular / Alto.
+
+    Los puntos de corte se obtienen de terciles internos (33 % y 67 %),
+    pero dichos valores NO se muestran al usuario.
+    """
+    if pd.isna(valor):
+        return "Sin dato"
+
+    serie = pd.to_numeric(
+        serie_referencia,
+        errors="coerce"
+    ).dropna()
+
+    if serie.empty:
+        return "Sin dato"
+
+    if serie.nunique() <= 1:
+        return "Regular"
+
+    corte_bajo = serie.quantile(1 / 3)
+    corte_alto = serie.quantile(2 / 3)
+
+    # Si la distribución tiene demasiados empates,
+    # se utiliza la mediana como respaldo.
+    if pd.isna(corte_bajo) or pd.isna(corte_alto):
+        return "Sin dato"
+
+    if corte_bajo == corte_alto:
+        mediana = serie.median()
+
+        if valor < mediana:
+            return "Bajo"
+
+        if valor > mediana:
+            return "Alto"
+
+        return "Regular"
+
+    if valor <= corte_bajo:
+        return "Bajo"
+
+    if valor >= corte_alto:
+        return "Alto"
+
+    return "Regular"
+
+
+def sitec_indicador_internet(valor):
+    texto = util_limpiar_texto(valor)
+
+    if texto == "":
+        return np.nan
+
+    return float("internet" in texto)
+
+
+def sitec_indicador_computadora(valor):
+    texto = util_limpiar_texto(valor)
+
+    if texto == "":
+        return np.nan
+
+    palabras = [
+        "computadora",
+        "laptop",
+        "pc",
+        "ordenador"
+    ]
+
+    return float(
+        any(palabra in texto for palabra in palabras)
+    )
+
+
+def enriquecer_master_perfil_integral(
+    df_maestro,
+    minimo_referencia_carrera=15
+):
+    """
+    Añade variables derivadas listas para el HTML y para el clustering integral.
+
+    Las categorías Bajo / Regular / Alto se calculan con referencia a la
+    misma carrera. Si una carrera tiene menos de `minimo_referencia_carrera`
+    observaciones válidas para una variable, se utiliza la cohorte completa
+    como respaldo para evitar cortes inestables.
+    """
+    df = df_maestro.copy()
+
+    # --------------------------------------------------------
+    # Variables SIITEC numéricas
+    # --------------------------------------------------------
+    mapa_numericas = {
+        "SIITEC Ingreso mensual hogar": [
+            "ingreso mensual",
+            "ingreso_mensual",
+            "ingreso familiar",
+            "ingreso mensual familiar"
+        ],
+        "SIITEC Habitantes hogar": [
+            "habitantes en casa",
+            "habitantes_casa",
+            "personas en casa",
+            "numero de habitantes",
+            "número de habitantes"
+        ],
+        "SIITEC Hijos": [
+            "numero de hijos",
+            "número de hijos",
+            "hijos"
+        ],
+        "SIITEC Estado salud numérico": [
+            "estado salud",
+            "estado_salud",
+            "estado de salud",
+            "salud"
+        ]
+    }
+
+    for salida, candidatos in mapa_numericas.items():
+        columna = sitec_buscar_columna_original(
+            df,
+            candidatos
+        )
+
+        if columna is not None:
+            df[salida] = df[columna].apply(
+                sitec_convertir_numero
+            )
+        else:
+            df[salida] = np.nan
+
+    habitantes = pd.to_numeric(
+        df["SIITEC Habitantes hogar"],
+        errors="coerce"
+    ).replace(0, np.nan)
+
+    ingreso = pd.to_numeric(
+        df["SIITEC Ingreso mensual hogar"],
+        errors="coerce"
+    )
+
+    df["SIITEC Ingreso por habitante"] = (
+        ingreso / habitantes
+    )
+
+    # --------------------------------------------------------
+    # Indicadores de salud
+    # --------------------------------------------------------
+    indicadores_texto = {
+        "SIITEC Enfermedad declarada (0/1)": [
+            "enfermedades",
+            "enfermedad"
+        ],
+        "SIITEC Discapacidad declarada (0/1)": [
+            "discapacidades",
+            "discapacidad"
+        ],
+        "SIITEC Especialista declarado (0/1)": [
+            "especialistas",
+            "especialista"
+        ]
+    }
+
+    for salida, candidatos in indicadores_texto.items():
+        columna = sitec_buscar_columna_original(
+            df,
+            candidatos
+        )
+
+        if columna is not None:
+            df[salida] = df[columna].apply(
+                sitec_contiene_texto_util
+            )
+        else:
+            df[salida] = np.nan
+
+    # --------------------------------------------------------
+    # Conectividad
+    # --------------------------------------------------------
+    columna_servicios = sitec_buscar_columna_original(
+        df,
+        [
+            "servicios disponibles",
+            "servicios",
+            "servicios vivienda"
+        ]
+    )
+
+    if columna_servicios is not None:
+        df["SIITEC Internet disponible (0/1)"] = (
+            df[columna_servicios].apply(
+                sitec_indicador_internet
+            )
+        )
+    else:
+        df["SIITEC Internet disponible (0/1)"] = np.nan
+
+    columna_dispositivos = sitec_buscar_columna_original(
+        df,
+        [
+            "dispositivos tecnologicos",
+            "dispositivos tecnológicos",
+            "dispositivos",
+            "equipo tecnologico",
+            "equipo tecnológico"
+        ]
+    )
+
+    if columna_dispositivos is not None:
+        df["SIITEC Computadora disponible (0/1)"] = (
+            df[columna_dispositivos].apply(
+                sitec_indicador_computadora
+            )
+        )
+    else:
+        df["SIITEC Computadora disponible (0/1)"] = np.nan
+
+    # --------------------------------------------------------
+    # Categorías continuas por carrera
+    # --------------------------------------------------------
+    variables_categoria = {
+        "Promedio bachillerato": "Categoría Promedio bachillerato",
+        "Resultado global EVALUATEC": "Categoría EVALUATEC",
+        "Propedéutico Ciencias Básicas": "Categoría Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento": "Categoría Propedéutico Departamento",
+        "Promedio Propedéutico": "Categoría Promedio Propedéutico",
+        "Score CHASIDE": "Categoría Score CHASIDE",
+        "SIITEC Ingreso mensual hogar": "Categoría Ingreso mensual hogar",
+        "SIITEC Ingreso por habitante": "Categoría Ingreso por habitante",
+        "SIITEC Habitantes hogar": "Categoría Habitantes hogar",
+        "SIITEC Estado salud numérico": "Categoría Estado salud"
+    }
+
+    for columna_valor, columna_categoria in variables_categoria.items():
+        if columna_valor not in df.columns:
+            df[columna_categoria] = "Sin dato"
+            df[
+                f"Referencia {columna_categoria}"
+            ] = "Sin dato"
+            continue
+
+        valores_globales = pd.to_numeric(
+            df[columna_valor],
+            errors="coerce"
+        )
+
+        df[columna_categoria] = "Sin dato"
+        df[f"Referencia {columna_categoria}"] = "Sin dato"
+
+        for carrera, indices in df.groupby(
+            "Carrera",
+            dropna=False
+        ).groups.items():
+            indices = list(indices)
+
+            serie_carrera = pd.to_numeric(
+                df.loc[indices, columna_valor],
+                errors="coerce"
+            )
+
+            if (
+                serie_carrera.notna().sum()
+                >= minimo_referencia_carrera
+            ):
+                referencia = serie_carrera
+                etiqueta_referencia = "Misma carrera"
+            else:
+                referencia = valores_globales
+                etiqueta_referencia = "Cohorte general"
+
+            for idx in indices:
+                valor = pd.to_numeric(
+                    pd.Series(
+                        [df.at[idx, columna_valor]]
+                    ),
+                    errors="coerce"
+                ).iloc[0]
+
+                df.at[
+                    idx,
+                    columna_categoria
+                ] = categoria_bajo_regular_alto(
+                    referencia,
+                    valor
+                )
+
+                df.at[
+                    idx,
+                    f"Referencia {columna_categoria}"
+                ] = etiqueta_referencia
+
+    return df
 
 
 # ============================================================
@@ -4601,6 +5073,572 @@ def aplicar_clustering_sitec(df_maestro, random_state=42):
     return df, resumen, metricas
 
 
+
+# ============================================================
+# CLUSTERING INTEGRAL POR CARRERA
+# ============================================================
+
+INTEGRAL_PERFILES_POR_CANTIDAD = {
+    2: [
+        "Perfil integral A · Mayor necesidad de acompañamiento",
+        "Perfil integral B · Condiciones relativamente favorables"
+    ],
+    3: [
+        "Perfil integral A · Mayor necesidad de acompañamiento",
+        "Perfil integral B · Condiciones intermedias",
+        "Perfil integral C · Condiciones relativamente favorables"
+    ],
+    4: [
+        "Perfil integral A · Mayor necesidad de acompañamiento",
+        "Perfil integral B · Necesidad moderada de apoyo",
+        "Perfil integral C · Condiciones intermedias favorables",
+        "Perfil integral D · Condiciones relativamente favorables"
+    ],
+    5: [
+        "Perfil integral A · Mayor necesidad de acompañamiento",
+        "Perfil integral B · Necesidad alta de apoyo",
+        "Perfil integral C · Condiciones intermedias",
+        "Perfil integral D · Condiciones favorables",
+        "Perfil integral E · Condiciones relativamente favorables"
+    ],
+    6: [
+        "Perfil integral A · Mayor necesidad de acompañamiento",
+        "Perfil integral B · Necesidad alta de apoyo",
+        "Perfil integral C · Necesidad moderada de apoyo",
+        "Perfil integral D · Condiciones intermedias",
+        "Perfil integral E · Condiciones favorables",
+        "Perfil integral F · Condiciones relativamente favorables"
+    ]
+}
+
+
+def construir_matriz_clustering_integral(df_carrera):
+    """
+    Combina:
+    - antecedentes académicos;
+    - EVALUATEC;
+    - propedéutico;
+    - CHASIDE;
+    - variables SIITEC numéricas;
+    - variables SIITEC categóricas codificadas por one-hot.
+
+    Se excluyen identificadores directos.
+    """
+    grupo = df_carrera.copy()
+
+    candidatas_academicas = [
+        "Promedio bachillerato",
+        "Resultado global EVALUATEC",
+        "Propedéutico Ciencias Básicas",
+        "Propedéutico Departamento",
+        "Promedio Propedéutico",
+        "Score CHASIDE",
+        "Coincidencia CHASIDE"
+    ]
+
+    candidatas_academicas.extend(
+        [
+            columna
+            for columna in grupo.columns
+            if columna.startswith("EVALUATEC ")
+        ]
+    )
+
+    candidatas_contextuales = [
+        "SIITEC Ingreso mensual hogar",
+        "SIITEC Habitantes hogar",
+        "SIITEC Ingreso por habitante",
+        "SIITEC Hijos",
+        "SIITEC Estado salud numérico",
+        "SIITEC Enfermedad declarada (0/1)",
+        "SIITEC Discapacidad declarada (0/1)",
+        "SIITEC Especialista declarado (0/1)",
+        "SIITEC Internet disponible (0/1)",
+        "SIITEC Computadora disponible (0/1)"
+    ]
+
+    base = pd.DataFrame(
+        index=grupo.index
+    )
+
+    for columna in (
+        candidatas_academicas
+        + candidatas_contextuales
+    ):
+        if columna not in grupo.columns:
+            continue
+
+        serie = pd.to_numeric(
+            grupo[columna],
+            errors="coerce"
+        )
+
+        if serie.notna().sum() < max(
+            3,
+            int(len(grupo) * 0.30)
+        ):
+            continue
+
+        if serie.nunique(dropna=True) <= 1:
+            continue
+
+        base[columna] = serie
+
+    # Añadir categóricas SIITEC disponibles.
+    matriz_sitec, _ = sitec_construir_variables_cluster(
+        grupo
+    )
+
+    for columna in matriz_sitec.columns:
+        if columna in base.columns:
+            continue
+
+        serie = pd.to_numeric(
+            matriz_sitec[columna],
+            errors="coerce"
+        )
+
+        if serie.notna().sum() < max(
+            3,
+            int(len(grupo) * 0.30)
+        ):
+            continue
+
+        if serie.nunique(dropna=True) <= 1:
+            continue
+
+        base[columna] = serie
+
+    return base
+
+
+def calcular_indice_integral_por_cluster(
+    matriz_original,
+    etiquetas
+):
+    """
+    Construye un índice interpretativo para ordenar los clusters.
+
+    Valores académicos, ingreso, conectividad y salud autopercibida
+    se interpretan en sentido favorable. Enfermedad/discapacidad/
+    atención por especialista se interpretan como mayor necesidad
+    de acompañamiento.
+
+    Las variables categóricas one-hot participan en el clustering,
+    pero no determinan por sí solas el orden de los perfiles.
+    """
+    matriz = matriz_original.copy()
+
+    columnas_positivas = [
+        columna
+        for columna in matriz.columns
+        if any(
+            termino in columna
+            for termino in [
+                "Promedio bachillerato",
+                "Resultado global EVALUATEC",
+                "Propedéutico Ciencias Básicas",
+                "Propedéutico Departamento",
+                "Promedio Propedéutico",
+                "Score CHASIDE",
+                "Coincidencia CHASIDE",
+                "EVALUATEC ",
+                "SIITEC Ingreso mensual hogar",
+                "SIITEC Ingreso por habitante",
+                "SIITEC Estado salud numérico",
+                "SIITEC Internet disponible",
+                "SIITEC Computadora disponible"
+            ]
+        )
+    ]
+
+    columnas_negativas = [
+        columna
+        for columna in matriz.columns
+        if any(
+            termino in columna
+            for termino in [
+                "SIITEC Enfermedad declarada",
+                "SIITEC Discapacidad declarada",
+                "SIITEC Especialista declarado"
+            ]
+        )
+    ]
+
+    z = pd.DataFrame(
+        index=matriz.index
+    )
+
+    for columna in columnas_positivas:
+        serie = pd.to_numeric(
+            matriz[columna],
+            errors="coerce"
+        )
+
+        desviacion = serie.std(ddof=0)
+
+        if pd.isna(desviacion) or desviacion == 0:
+            continue
+
+        z[columna] = (
+            serie - serie.mean()
+        ) / desviacion
+
+    for columna in columnas_negativas:
+        serie = pd.to_numeric(
+            matriz[columna],
+            errors="coerce"
+        )
+
+        desviacion = serie.std(ddof=0)
+
+        if pd.isna(desviacion) or desviacion == 0:
+            continue
+
+        z[columna] = -(
+            (serie - serie.mean())
+            / desviacion
+        )
+
+    if z.empty:
+        indice_individual = pd.Series(
+            0.0,
+            index=matriz.index
+        )
+    else:
+        indice_individual = z.mean(
+            axis=1,
+            skipna=True
+        )
+
+    auxiliar = pd.DataFrame(
+        {
+            "Cluster integral": etiquetas,
+            "Índice integral": indice_individual.values
+        },
+        index=matriz.index
+    )
+
+    indice_cluster = (
+        auxiliar.groupby(
+            "Cluster integral"
+        )["Índice integral"]
+        .mean()
+        .to_dict()
+    )
+
+    return (
+        indice_individual,
+        indice_cluster
+    )
+
+
+def aplicar_clustering_integral_por_carrera(
+    df_maestro,
+    random_state=42
+):
+    """
+    Clustering integral por carrera.
+
+    Utiliza todos los factores analíticamente útiles disponibles,
+    aunque posteriormente el HTML oculte parte de ellos según el rol.
+    """
+    df = df_maestro.copy()
+
+    defaults = {
+        "Cluster integral": pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        ),
+        "Perfil integral": "Sin segmentación integral",
+        "Orden prioridad integral": pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        ),
+        "Nivel atención integral": "Sin segmentación integral",
+        "Índice integral del perfil": np.nan,
+        "Distancia centroide integral": np.nan,
+        "K integral": pd.Series(
+            pd.NA,
+            index=df.index,
+            dtype="Int64"
+        ),
+        "Silueta integral": np.nan,
+        "Davies-Bouldin integral": np.nan,
+        "Variables clustering integral": ""
+    }
+
+    for columna, valor in defaults.items():
+        df[columna] = valor
+
+    resumenes = []
+    metricas_todas = []
+
+    for carrera, indices in df.groupby(
+        "Carrera",
+        dropna=False
+    ).groups.items():
+        indices = list(indices)
+        grupo = df.loc[indices].copy()
+
+        matriz_original = construir_matriz_clustering_integral(
+            grupo
+        )
+
+        if (
+            len(grupo) < 6
+            or matriz_original.shape[1] < 2
+        ):
+            df.loc[
+                indices,
+                "Perfil integral"
+            ] = "Datos insuficientes para segmentar"
+
+            df.loc[
+                indices,
+                "Nivel atención integral"
+            ] = "Revisión individual"
+
+            continue
+
+        imputador = SimpleImputer(
+            strategy="median"
+        )
+
+        escalador = StandardScaler()
+
+        X_imputado = imputador.fit_transform(
+            matriz_original
+        )
+
+        X = escalador.fit_transform(
+            X_imputado
+        )
+
+        k, metricas = seleccionar_k_automatico(
+            X,
+            random_state=random_state
+        )
+
+        if k is None:
+            continue
+
+        modelo = KMeans(
+            n_clusters=k,
+            random_state=random_state,
+            n_init=30
+        )
+
+        etiquetas = modelo.fit_predict(X)
+
+        distancias = np.linalg.norm(
+            X - modelo.cluster_centers_[etiquetas],
+            axis=1
+        )
+
+        (
+            indice_individual,
+            indice_cluster
+        ) = calcular_indice_integral_por_cluster(
+            matriz_original,
+            etiquetas
+        )
+
+        orden = sorted(
+            indice_cluster,
+            key=indice_cluster.get
+        )
+
+        nombres = INTEGRAL_PERFILES_POR_CANTIDAD.get(
+            len(orden),
+            [
+                f"Perfil integral {i + 1}"
+                for i in range(len(orden))
+            ]
+        )
+
+        mapa_nombre = {
+            cluster: nombres[posicion]
+            for posicion, cluster in enumerate(orden)
+        }
+
+        mapa_prioridad = {
+            cluster: posicion + 1
+            for posicion, cluster in enumerate(orden)
+        }
+
+        mejor = metricas[
+            metricas["k"] == k
+        ].iloc[0]
+
+        for posicion_local, idx_global in enumerate(indices):
+            cluster = int(etiquetas[posicion_local])
+            prioridad = mapa_prioridad[cluster]
+
+            df.at[
+                idx_global,
+                "Cluster integral"
+            ] = cluster
+
+            df.at[
+                idx_global,
+                "Perfil integral"
+            ] = mapa_nombre[cluster]
+
+            df.at[
+                idx_global,
+                "Orden prioridad integral"
+            ] = prioridad
+
+            df.at[
+                idx_global,
+                "Nivel atención integral"
+            ] = (
+                "Prioridad 1"
+                if prioridad == 1
+                else "Prioridad 2"
+                if prioridad == 2
+                else "Seguimiento regular"
+            )
+
+            df.at[
+                idx_global,
+                "Índice integral del perfil"
+            ] = indice_cluster[cluster]
+
+            df.at[
+                idx_global,
+                "Distancia centroide integral"
+            ] = distancias[posicion_local]
+
+            df.at[
+                idx_global,
+                "K integral"
+            ] = int(k)
+
+            df.at[
+                idx_global,
+                "Silueta integral"
+            ] = float(
+                mejor["Silueta"]
+            )
+
+            df.at[
+                idx_global,
+                "Davies-Bouldin integral"
+            ] = float(
+                mejor["Davies-Bouldin"]
+            )
+
+            df.at[
+                idx_global,
+                "Variables clustering integral"
+            ] = ", ".join(
+                matriz_original.columns.tolist()
+            )
+
+        metricas = metricas.copy()
+        metricas["Carrera"] = carrera
+        metricas["K integral seleccionado"] = k
+        metricas["Variables usadas"] = ", ".join(
+            matriz_original.columns.tolist()
+        )
+        metricas_todas.append(metricas)
+
+        sub = df.loc[indices]
+
+        for perfil, g in sub.groupby(
+            "Perfil integral"
+        ):
+            resumenes.append(
+                {
+                    "Carrera": carrera,
+                    "Perfil integral": perfil,
+                    "Orden prioridad integral": int(
+                        pd.to_numeric(
+                            g[
+                                "Orden prioridad integral"
+                            ],
+                            errors="coerce"
+                        )
+                        .dropna()
+                        .iloc[0]
+                    ),
+                    "Estudiantes": len(g),
+                    "Porcentaje carrera": round(
+                        100 * len(g) / len(grupo),
+                        1
+                    ),
+                    "Promedio bachillerato": pd.to_numeric(
+                        g["Promedio bachillerato"],
+                        errors="coerce"
+                    ).mean(),
+                    "Promedio EVALUATEC": pd.to_numeric(
+                        g["Resultado global EVALUATEC"],
+                        errors="coerce"
+                    ).mean(),
+                    "Promedio Propedéutico": pd.to_numeric(
+                        g["Promedio Propedéutico"],
+                        errors="coerce"
+                    ).mean(),
+                    "Coincidencia CHASIDE (%)": 100 * pd.to_numeric(
+                        g["Coincidencia CHASIDE"],
+                        errors="coerce"
+                    ).mean(),
+                    "Ingreso por habitante": pd.to_numeric(
+                        g.get(
+                            "SIITEC Ingreso por habitante",
+                            np.nan
+                        ),
+                        errors="coerce"
+                    ).mean(),
+                    "Estado salud": pd.to_numeric(
+                        g.get(
+                            "SIITEC Estado salud numérico",
+                            np.nan
+                        ),
+                        errors="coerce"
+                    ).mean(),
+                    "Índice integral del perfil": pd.to_numeric(
+                        g["Índice integral del perfil"],
+                        errors="coerce"
+                    ).mean(),
+                    "K integral": k,
+                    "Silueta integral": float(
+                        mejor["Silueta"]
+                    ),
+                    "Davies-Bouldin integral": float(
+                        mejor["Davies-Bouldin"]
+                    )
+                }
+            )
+
+    resumen = pd.DataFrame(
+        resumenes
+    )
+
+    if not resumen.empty:
+        resumen = resumen.sort_values(
+            [
+                "Carrera",
+                "Orden prioridad integral"
+            ]
+        ).reset_index(drop=True)
+
+    metricas = (
+        pd.concat(
+            metricas_todas,
+            ignore_index=True
+        )
+        if metricas_todas
+        else pd.DataFrame()
+    )
+
+    return df, resumen, metricas
+
+
 # ============================================================
 # CLUSTERING ACADÉMICO POR CARRERA
 # ============================================================
@@ -5042,6 +6080,16 @@ def generar_excel_maestro(df_maestro):
         pd.DataFrame()
     )
 
+    df_resumen_clusters_integral = st.session_state.get(
+        "df_resumen_clusters_integral",
+        pd.DataFrame()
+    )
+
+    df_metricas_clusters_integral = st.session_state.get(
+        "df_metricas_clusters_integral",
+        pd.DataFrame()
+    )
+
     resumen_carrera = (
         df_maestro
         .groupby("Carrera", dropna=False)
@@ -5192,6 +6240,20 @@ def generar_excel_maestro(df_maestro):
                 writer,
                 index=False,
                 sheet_name="SIITEC métricas cluster"
+            )
+
+        if not df_resumen_clusters_integral.empty:
+            df_resumen_clusters_integral.to_excel(
+                writer,
+                index=False,
+                sheet_name="Perfiles integrales"
+            )
+
+        if not df_metricas_clusters_integral.empty:
+            df_metricas_clusters_integral.to_excel(
+                writer,
+                index=False,
+                sheet_name="Métricas integral"
             )
 
         workbook = writer.book
@@ -5633,6 +6695,13 @@ def render_app_maestra():
                     )
 
                 # ----------------------------------------------------
+                # Variables derivadas + categorías por carrera
+                # ----------------------------------------------------
+                df_maestro = enriquecer_master_perfil_integral(
+                    df_maestro
+                )
+
+                # ----------------------------------------------------
                 # Clustering SIITEC en segundo plano
                 # ----------------------------------------------------
                 (
@@ -5651,8 +6720,27 @@ def render_app_maestra():
                     "df_metricas_clusters_sitec"
                 ] = df_metricas_clusters_sitec.copy()
 
-                # Se conserva la segmentación académica existente.
-                # Ninguno de los dos clustering se visualiza en Streamlit.
+                # ----------------------------------------------------
+                # Clustering integral por carrera
+                # ----------------------------------------------------
+                (
+                    df_maestro,
+                    df_resumen_clusters_integral,
+                    df_metricas_clusters_integral
+                ) = aplicar_clustering_integral_por_carrera(
+                    df_maestro
+                )
+
+                st.session_state[
+                    "df_resumen_clusters_integral"
+                ] = df_resumen_clusters_integral.copy()
+
+                st.session_state[
+                    "df_metricas_clusters_integral"
+                ] = df_metricas_clusters_integral.copy()
+
+                # Se conserva también la segmentación académica existente.
+                # Ningún clustering se visualiza en Streamlit.
                 (
                     df_maestro,
                     df_resumen_clusters,
@@ -5788,6 +6876,8 @@ def validar_funciones_requeridas():
         "sitec_preparar_para_cruce",
         "integrar_sitec_en_maestro",
         "aplicar_clustering_sitec",
+        "enriquecer_master_perfil_integral",
+        "aplicar_clustering_integral_por_carrera",
         "preparar_historial_para_cruce",
         "preparar_evaluatec_desde_bloques",
         "generar_concentrado_maestro",
