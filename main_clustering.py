@@ -1430,6 +1430,23 @@ def hist_convertir_promedio(valor):
         return np.nan, "Sin dato"
 
     if isinstance(valor, (datetime, date, pd.Timestamp)):
+        # Algunos promedios escritos como 8.6, 9.2, etc. pueden llegar
+        # desde Excel convertidos accidentalmente a fecha.
+        # Se reconstruye el decimal usando día y mes:
+        # 8-jun -> 8.6 -> 86; 9-oct -> 9.10 -> 91.
+        dia = int(valor.day)
+        mes = int(valor.month)
+
+        if 0 <= dia <= 10:
+            divisor = 10 if mes <= 9 else 100
+            numero_recuperado = dia + (mes / divisor)
+
+            if 0 <= numero_recuperado <= 10:
+                return (
+                    round(numero_recuperado * 10, 2),
+                    "Recuperado de formato fecha y convertido de escala 0-10"
+                )
+
         return np.nan, "Dato dudoso: formato fecha"
 
     texto = str(valor).strip()
@@ -4095,6 +4112,8 @@ def enriquecer_master_perfil_integral(
             "ingreso mensual familiar"
         ],
         "SIITEC Habitantes hogar": [
+            "num_habitantes_casa",
+            "num habitantes casa",
             "habitantes en casa",
             "habitantes_casa",
             "personas en casa",
@@ -4140,6 +4159,30 @@ def enriquecer_master_perfil_integral(
     df["SIITEC Ingreso por habitante"] = (
         ingreso / habitantes
     )
+
+    # Control de calidad: si SIITEC trae habitantes originales pero la
+    # variable derivada no recuperó ninguno, detener el proceso.
+    columna_habitantes_original = sitec_buscar_columna_original(
+        df,
+        ["num_habitantes_casa", "habitantes_casa", "habitantes en casa"]
+    )
+
+    if columna_habitantes_original is not None:
+        originales_validos = pd.to_numeric(
+            df[columna_habitantes_original],
+            errors="coerce"
+        ).notna().sum()
+
+        derivados_validos = pd.to_numeric(
+            df["SIITEC Habitantes hogar"],
+            errors="coerce"
+        ).notna().sum()
+
+        if originales_validos > 0 and derivados_validos == 0:
+            raise ValueError(
+                "SIITEC contiene datos de habitantes del hogar, pero no fue "
+                "posible recuperarlos para el perfil integral."
+            )
 
     # --------------------------------------------------------
     # Indicadores de salud
