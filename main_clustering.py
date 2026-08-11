@@ -4087,6 +4087,46 @@ def sitec_indicador_computadora(valor):
     )
 
 
+
+def sitec_indicador_telefono_inteligente(valor):
+    """Indica disponibilidad declarada de teléfono móvil inteligente."""
+    texto = util_limpiar_texto(valor)
+
+    if texto == "":
+        return np.nan
+
+    palabras = [
+        "telefono movil inteligente",
+        "teléfono móvil inteligente",
+        "telefono inteligente",
+        "teléfono inteligente",
+        "smartphone",
+        "celular"
+    ]
+
+    return float(
+        any(util_limpiar_texto(palabra) in texto for palabra in palabras)
+    )
+
+
+def sitec_indicador_tableta(valor):
+    """Indica disponibilidad declarada de tableta."""
+    texto = util_limpiar_texto(valor)
+
+    if texto == "":
+        return np.nan
+
+    palabras = [
+        "tableta",
+        "tablet",
+        "ipad"
+    ]
+
+    return float(
+        any(util_limpiar_texto(palabra) in texto for palabra in palabras)
+    )
+
+
 def enriquecer_master_perfil_integral(
     df_maestro,
     minimo_referencia_carrera=15
@@ -4253,8 +4293,20 @@ def enriquecer_master_perfil_integral(
                 sitec_indicador_computadora
             )
         )
+        df["SIITEC Teléfono inteligente disponible (0/1)"] = (
+            df[columna_dispositivos].apply(
+                sitec_indicador_telefono_inteligente
+            )
+        )
+        df["SIITEC Tableta disponible (0/1)"] = (
+            df[columna_dispositivos].apply(
+                sitec_indicador_tableta
+            )
+        )
     else:
         df["SIITEC Computadora disponible (0/1)"] = np.nan
+        df["SIITEC Teléfono inteligente disponible (0/1)"] = np.nan
+        df["SIITEC Tableta disponible (0/1)"] = np.nan
 
     # --------------------------------------------------------
     # Categorías continuas por carrera
@@ -5119,6 +5171,9 @@ def aplicar_clustering_sitec(df_maestro, random_state=42):
 
 # ============================================================
 # CLUSTERING INTEGRAL POR CARRERA
+# Versión depurada INTEGRA 2026-08-11:
+# sin sexo, sangre, estado civil, ocupación, hijos, servicios,
+# internet independiente ni variables académicas/contextuales redundantes.
 # ============================================================
 
 INTEGRAL_PERFILES_POR_CANTIDAD = {
@@ -5157,69 +5212,67 @@ INTEGRAL_PERFILES_POR_CANTIDAD = {
 
 def construir_matriz_clustering_integral(df_carrera):
     """
-    Combina:
-    - antecedentes académicos;
-    - EVALUATEC;
-    - propedéutico;
-    - CHASIDE;
-    - variables SIITEC numéricas;
-    - variables SIITEC categóricas codificadas por one-hot.
+    Matriz DEPURADA para el clustering integral por carrera.
 
-    Se excluyen identificadores directos.
+    Variables incluidas:
+    ACADÉMICAS
+    - Promedio bachillerato
+    - Resultado global EVALUATEC
+    - Propedéutico Ciencias Básicas
+    - Propedéutico Departamento (evaluación de la carrera)
+
+    VOCACIONAL
+    - Coincidencia CHASIDE (sí/no)
+
+    SOCIOECONÓMICAS
+    - SIITEC Ingreso por habitante
+    - Condición de vivienda, codificada one-hot
+
+    SALUD
+    - SIITEC Estado salud numérico
+    - Enfermedad declarada
+    - Discapacidad declarada
+    - Especialista declarado
+
+    RECURSOS TECNOLÓGICOS
+    - Computadora disponible
+    - Teléfono inteligente disponible
+    - Tableta disponible
+
+    Deliberadamente NO incluye:
+    sexo, grupo sanguíneo, estado civil, ocupación, hijos, servicios,
+    internet independiente, ingreso mensual del hogar, habitantes del hogar,
+    Promedio Propedéutico, Score CHASIDE, carrera sugerida CHASIDE,
+    identificadores personales ni todas las subescalas EVALUATEC.
+
+    La intención es evitar sobreponderar dimensiones por redundancia.
     """
     grupo = df_carrera.copy()
+    base = pd.DataFrame(index=grupo.index)
 
-    candidatas_academicas = [
+    candidatas_numericas = [
         "Promedio bachillerato",
         "Resultado global EVALUATEC",
         "Propedéutico Ciencias Básicas",
         "Propedéutico Departamento",
-        "Promedio Propedéutico",
-        "Score CHASIDE",
-        "Coincidencia CHASIDE"
-    ]
-
-    candidatas_academicas.extend(
-        [
-            columna
-            for columna in grupo.columns
-            if columna.startswith("EVALUATEC ")
-        ]
-    )
-
-    candidatas_contextuales = [
-        "SIITEC Ingreso mensual hogar",
-        "SIITEC Habitantes hogar",
+        "Coincidencia CHASIDE",
         "SIITEC Ingreso por habitante",
-        "SIITEC Hijos",
         "SIITEC Estado salud numérico",
         "SIITEC Enfermedad declarada (0/1)",
         "SIITEC Discapacidad declarada (0/1)",
         "SIITEC Especialista declarado (0/1)",
-        "SIITEC Internet disponible (0/1)",
-        "SIITEC Computadora disponible (0/1)"
+        "SIITEC Computadora disponible (0/1)",
+        "SIITEC Teléfono inteligente disponible (0/1)",
+        "SIITEC Tableta disponible (0/1)"
     ]
 
-    base = pd.DataFrame(
-        index=grupo.index
-    )
-
-    for columna in (
-        candidatas_academicas
-        + candidatas_contextuales
-    ):
+    for columna in candidatas_numericas:
         if columna not in grupo.columns:
             continue
 
-        serie = pd.to_numeric(
-            grupo[columna],
-            errors="coerce"
-        )
+        serie = pd.to_numeric(grupo[columna], errors="coerce")
 
-        if serie.notna().sum() < max(
-            3,
-            int(len(grupo) * 0.30)
-        ):
+        if serie.notna().sum() < max(3, int(len(grupo) * 0.30)):
             continue
 
         if serie.nunique(dropna=True) <= 1:
@@ -5227,30 +5280,49 @@ def construir_matriz_clustering_integral(df_carrera):
 
         base[columna] = serie
 
-    # Añadir categóricas SIITEC disponibles.
-    matriz_sitec, _ = sitec_construir_variables_cluster(
-        grupo
+    # Vivienda: única variable categórica incluida.
+    columna_vivienda = sitec_buscar_columna_original(
+        grupo,
+        [
+            "propiedad_casa",
+            "propiedad casa",
+            "propiedad de vivienda",
+            "propiedad_vivienda",
+            "tipo de vivienda",
+            "vivienda"
+        ]
     )
 
-    for columna in matriz_sitec.columns:
-        if columna in base.columns:
-            continue
-
-        serie = pd.to_numeric(
-            matriz_sitec[columna],
-            errors="coerce"
+    if columna_vivienda is not None:
+        serie_vivienda = (
+            grupo[columna_vivienda]
+            .fillna("Sin dato")
+            .astype(str)
+            .map(util_limpiar_texto_visible)
         )
 
-        if serie.notna().sum() < max(
-            3,
-            int(len(grupo) * 0.30)
-        ):
-            continue
+        # No incorporar "Sin dato" como una característica real.
+        dummies = pd.get_dummies(
+            serie_vivienda,
+            prefix="SIITEC vivienda",
+            dtype=float
+        )
 
-        if serie.nunique(dropna=True) <= 1:
-            continue
+        columnas_vivienda = []
+        for columna in dummies.columns:
+            clave = util_limpiar_texto(columna)
+            if "sin dato" in clave:
+                continue
 
-        base[columna] = serie
+            prevalencia = dummies[columna].mean()
+            if 0.02 <= prevalencia <= 0.98:
+                columnas_vivienda.append(columna)
+
+        if columnas_vivienda:
+            base = pd.concat(
+                [base, dummies[columnas_vivienda]],
+                axis=1
+            )
 
     return base
 
@@ -5260,15 +5332,17 @@ def calcular_indice_integral_por_cluster(
     etiquetas
 ):
     """
-    Construye un índice interpretativo para ordenar los clusters.
+    Índice interpretativo para ordenar los clusters depurados.
 
-    Valores académicos, ingreso, conectividad y salud autopercibida
-    se interpretan en sentido favorable. Enfermedad/discapacidad/
-    atención por especialista se interpretan como mayor necesidad
-    de acompañamiento.
+    Favorables:
+    desempeño académico, coincidencia vocacional, ingreso per cápita,
+    salud autopercibida y disponibilidad tecnológica.
 
-    Las variables categóricas one-hot participan en el clustering,
-    pero no determinan por sí solas el orden de los perfiles.
+    Mayor necesidad:
+    enfermedad, discapacidad y atención por especialista.
+
+    Vivienda participa en la formación de clusters, pero no se fuerza a
+    una jerarquía favorable/desfavorable en este índice.
     """
     matriz = matriz_original.copy()
 
@@ -5282,15 +5356,12 @@ def calcular_indice_integral_por_cluster(
                 "Resultado global EVALUATEC",
                 "Propedéutico Ciencias Básicas",
                 "Propedéutico Departamento",
-                "Promedio Propedéutico",
-                "Score CHASIDE",
                 "Coincidencia CHASIDE",
-                "EVALUATEC ",
-                "SIITEC Ingreso mensual hogar",
                 "SIITEC Ingreso por habitante",
                 "SIITEC Estado salud numérico",
-                "SIITEC Internet disponible",
-                "SIITEC Computadora disponible"
+                "SIITEC Computadora disponible",
+                "SIITEC Teléfono inteligente disponible",
+                "SIITEC Tableta disponible"
             ]
         )
     ]
@@ -5308,51 +5379,30 @@ def calcular_indice_integral_por_cluster(
         )
     ]
 
-    z = pd.DataFrame(
-        index=matriz.index
-    )
+    z = pd.DataFrame(index=matriz.index)
 
     for columna in columnas_positivas:
-        serie = pd.to_numeric(
-            matriz[columna],
-            errors="coerce"
-        )
-
+        serie = pd.to_numeric(matriz[columna], errors="coerce")
         desviacion = serie.std(ddof=0)
 
         if pd.isna(desviacion) or desviacion == 0:
             continue
 
-        z[columna] = (
-            serie - serie.mean()
-        ) / desviacion
+        z[columna] = (serie - serie.mean()) / desviacion
 
     for columna in columnas_negativas:
-        serie = pd.to_numeric(
-            matriz[columna],
-            errors="coerce"
-        )
-
+        serie = pd.to_numeric(matriz[columna], errors="coerce")
         desviacion = serie.std(ddof=0)
 
         if pd.isna(desviacion) or desviacion == 0:
             continue
 
-        z[columna] = -(
-            (serie - serie.mean())
-            / desviacion
-        )
+        z[columna] = -((serie - serie.mean()) / desviacion)
 
     if z.empty:
-        indice_individual = pd.Series(
-            0.0,
-            index=matriz.index
-        )
+        indice_individual = pd.Series(0.0, index=matriz.index)
     else:
-        indice_individual = z.mean(
-            axis=1,
-            skipna=True
-        )
+        indice_individual = z.mean(axis=1, skipna=True)
 
     auxiliar = pd.DataFrame(
         {
@@ -5363,17 +5413,12 @@ def calcular_indice_integral_por_cluster(
     )
 
     indice_cluster = (
-        auxiliar.groupby(
-            "Cluster integral"
-        )["Índice integral"]
+        auxiliar.groupby("Cluster integral")["Índice integral"]
         .mean()
         .to_dict()
     )
 
-    return (
-        indice_individual,
-        indice_cluster
-    )
+    return indice_individual, indice_cluster
 
 
 def aplicar_clustering_integral_por_carrera(
